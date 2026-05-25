@@ -335,6 +335,12 @@ class PCVRHyFormerRankingTrainer:
         if torch.cuda.is_available() and str(self.device).startswith('cuda'):
             torch.cuda.reset_peak_memory_stats(self.device)
 
+    def _log_final_learned_scalars(self) -> None:
+        model = getattr(self.model, 'module', self.model)
+        if hasattr(model, 'seq_calendar_alpha'):
+            alpha = float(model.seq_calendar_alpha.detach().cpu().item())
+            logging.info(f"Final seq_calendar_alpha={alpha:.8f}")
+
     def train(self) -> None:
         """执行完整训练流程。
 
@@ -407,6 +413,7 @@ class PCVRHyFormerRankingTrainer:
                         f"Reached max_train_steps={self.max_train_steps}; "
                         "stopping before validation/checkpoint for speed probe"
                     )
+                    self._log_final_learned_scalars()
                     return
 
                 # step 级验证，用于较长 epoch 中提前观察 AUC 曲线。
@@ -426,6 +433,7 @@ class PCVRHyFormerRankingTrainer:
 
                     if self.early_stopping.early_stop:
                         logging.info(f"Early stopping at step {total_step}")
+                        self._log_final_learned_scalars()
                         return
 
             logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
@@ -472,6 +480,8 @@ class PCVRHyFormerRankingTrainer:
                         restored += 1
                 logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
                              f"restored optimizer state for {restored} low-cardinality params")
+
+        self._log_final_learned_scalars()
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
         """把 batch 字典整理成模型 forward 需要的 ``ModelInput``。"""

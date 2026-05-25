@@ -16,13 +16,14 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --batch_size 256 \
     --log_every_n_steps 200 \
     --patience 3 \
+    --num_epochs 6 \
     --amp_dtype bf16 \
     --use_seq_calendar_features \
     --use_engineered_dense_features \
     --use_shared_fid_tuple_token \
     --shared_fids 62,63,64,65,66 \
     --shared_fid_tuple_mode replace \
-    --d_model 60 \
+    --d_model 84 \
     "$@"
 
 # ---- 备选配置：由 ns_groups.json 驱动的 GroupNSTokenizer ----

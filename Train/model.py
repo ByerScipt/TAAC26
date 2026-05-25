@@ -1528,6 +1528,7 @@ class PCVRHyFormer(nn.Module):
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_engineered_dense_features = use_engineered_dense_features
         self.engineered_dense_dim = engineered_dense_dim if use_engineered_dense_features else 0
+        self.context_time_token_count = 1 if use_seq_calendar_features else 0
         self.use_shared_fid_tuple_token = use_shared_fid_tuple_token
         self.shared_fid_tuple_mode = shared_fid_tuple_mode
         if shared_fid_tuple_mode not in ('replace', 'additive'):
@@ -1636,6 +1637,7 @@ class PCVRHyFormer(nn.Module):
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
+                nn.BatchNorm1d(user_dense_dim),
                 nn.Linear(user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
@@ -1660,6 +1662,7 @@ class PCVRHyFormer(nn.Module):
         # 统计最终 NS token 数，用于后续 query generator 和 RankMixer。
         self.num_ns = (num_user_ns + self.shared_fid_tuple_token_count
                        + (1 if self.has_user_dense else 0)
+                       + self.context_time_token_count
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== 检查 RankMixer full 模式的维度约束 ==================
@@ -1733,6 +1736,7 @@ class PCVRHyFormer(nn.Module):
                 'day_of_month': nn.Embedding(32, d_model, padding_idx=0),
             })
             self.seq_calendar_alpha = nn.Parameter(torch.zeros(1))
+            self.context_time_token_norm = nn.LayerNorm(d_model)
 
         # ================== HyFormer 组件 ==================
         # MultiSeqQueryGenerator 根据 NS token 和序列 summary 生成每路 query token。
@@ -2072,12 +2076,21 @@ class PCVRHyFormer(nn.Module):
                 )
             user_dense_tok = F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
+        context_time_tok = self._build_context_time_token(inputs)
+        if context_time_tok is not None:
+            ns_parts.append(context_time_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
 
         return torch.cat(ns_parts, dim=1)
+
+    def _build_context_time_token(self, inputs: ModelInput) -> Optional[torch.Tensor]:
+        if not self.use_seq_calendar_features:
+            return None
+        context_time = self._build_time_context(inputs)
+        return self.context_time_token_norm(context_time).unsqueeze(1)
 
     def _build_time_context(self, inputs: ModelInput) -> torch.Tensor:
         """构建点击时间的上下文向量，用于 time-conditioned DIN query。"""

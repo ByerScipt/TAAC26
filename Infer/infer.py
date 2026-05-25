@@ -48,9 +48,9 @@ logging.basicConfig(
 # When the feature is enabled we therefore use the constant exposed by the
 # dataset module; ``0`` means disabled.
 _FALLBACK_MODEL_CFG = {
-    'd_model': 60,
+    'd_model': 84,
     'emb_dim': 64,
-    'num_queries': 1,
+    'num_queries': 3,
     'num_hyformer_blocks': 2,
     'num_heads': 4,
     'seq_encoder_type': 'transformer',
@@ -64,14 +64,14 @@ _FALLBACK_MODEL_CFG = {
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
-    'emb_skip_threshold': 0,
+    'emb_skip_threshold': 1000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
-    'user_ns_tokens': 0,
-    'item_ns_tokens': 0,
+    'user_ns_tokens': 5,
+    'item_ns_tokens': 2,
     'use_engineered_dense_features': True,
     'engineered_dense_dim': ENGINEERED_DENSE_DIM,
-    'use_shared_fid_tuple_token': False,
+    'use_shared_fid_tuple_token': True,
     'shared_fids': [62, 63, 64, 65, 66],
     'shared_fid_tuple_mode': 'replace',
 }

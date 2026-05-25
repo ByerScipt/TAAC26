@@ -422,9 +422,8 @@ class RankMixerBlock(nn.Module):
 class MultiSeqQueryGenerator(nn.Module):
     """多序列 query token 生成模块。
 
-    Generates Q tokens independently for each sequence:
-    For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, DINPool(Seq_i, candidate_item))
+    每个序列域独立生成自己的 Q token。对第 i 个序列域：
+        GlobalInfo_i = Concat(所有 NS token 展平, DINPool(Seq_i, candidate_item))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
 
     这样每一路序列都有专属 query，但 query 的生成会看到共享的 user/item NS 信息。
@@ -453,8 +452,8 @@ class MultiSeqQueryGenerator(nn.Module):
         # 对拼接后的 global_info 做 LayerNorm，稳定大维度拼接后的数值尺度。
         self.global_info_norm = nn.LayerNorm(global_info_dim)
 
-        # Compress all item-side NS tokens (item_ns + optional item_dense)
-        # into one d_model query for DIN target-aware pooling.
+        # 将 item 侧所有 NS token（item_ns + 可选 item_dense）拼接后压缩到 d_model，
+        # 作为 DIN target-aware pooling 的 query。
         item_concat_dim = self.num_item_side_tokens * d_model
         self.item_query_norm = nn.LayerNorm(item_concat_dim)
         self.item_query_mlp = nn.Sequential(
@@ -465,7 +464,7 @@ class MultiSeqQueryGenerator(nn.Module):
         )
 
         # DIN-style target-aware pooling:
-        # score_t = MLP([q, k_t, q-k_t, q*k_t]), then masked softmax weighted sum.
+        # score_t = MLP([q, k_t, q-k_t, q*k_t])，再对有效位置做 softmax 加权求和。
         din_hidden_dim = d_model * hidden_mult
         self.din_attn_mlp = nn.Sequential(
             nn.Linear(4 * d_model, din_hidden_dim),
@@ -510,8 +509,8 @@ class MultiSeqQueryGenerator(nn.Module):
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
 
-        # Candidate-item conditioning vector: concat all item-side tokens
-        # (item_ns + optional item_dense), then project to d_model.
+        # 候选物品条件向量：取 item 侧全部 token（item_ns + 可选 item_dense）拼接，
+        # 再映射到 d_model。
         item_side_tokens = ns_tokens[:, -self.num_item_side_tokens:, :]  # (B, K_item, D)
         item_concat = item_side_tokens.reshape(B, -1)  # (B, K_item*D)
         item_concat = self.item_query_norm(item_concat)
@@ -521,9 +520,9 @@ class MultiSeqQueryGenerator(nn.Module):
 
         q_tokens_list = []
         for i in range(self.num_sequences):
-            # DIN-style target-aware weighted pooling.
+            # DIN-style target-aware weighted pooling。
             seq_tokens = seq_tokens_list[i]  # (B, L_i, D)
-            valid_mask = ~seq_padding_masks[i]  # (B, L_i), True = valid
+            valid_mask = ~seq_padding_masks[i]  # (B, L_i), True 表示有效位置。
 
             L_i = seq_tokens.shape[1]
             query = candidate_item.unsqueeze(1).expand(-1, L_i, -1)  # (B, L_i, D)
@@ -1529,6 +1528,7 @@ class PCVRHyFormer(nn.Module):
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_engineered_dense_features = use_engineered_dense_features
         self.engineered_dense_dim = engineered_dense_dim if use_engineered_dense_features else 0
+        self.context_time_token_count = 1 if use_seq_calendar_features else 0
         self.use_shared_fid_tuple_token = use_shared_fid_tuple_token
         self.shared_fid_tuple_mode = shared_fid_tuple_mode
         if shared_fid_tuple_mode not in ('replace', 'additive'):
@@ -1637,6 +1637,7 @@ class PCVRHyFormer(nn.Module):
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
+                nn.BatchNorm1d(user_dense_dim),
                 nn.Linear(user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
@@ -1661,6 +1662,7 @@ class PCVRHyFormer(nn.Module):
         # 统计最终 NS token 数，用于后续 query generator 和 RankMixer。
         self.num_ns = (num_user_ns + self.shared_fid_tuple_token_count
                        + (1 if self.has_user_dense else 0)
+                       + self.context_time_token_count
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== 检查 RankMixer full 模式的维度约束 ==================
@@ -1734,6 +1736,7 @@ class PCVRHyFormer(nn.Module):
                 'day_of_month': nn.Embedding(32, d_model, padding_idx=0),
             })
             self.seq_calendar_alpha = nn.Parameter(torch.zeros(1))
+            self.context_time_token_norm = nn.LayerNorm(d_model)
 
         # ================== HyFormer 组件 ==================
         # MultiSeqQueryGenerator 根据 NS token 和序列 summary 生成每路 query token。
@@ -2073,6 +2076,9 @@ class PCVRHyFormer(nn.Module):
                 )
             user_dense_tok = F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
+        context_time_tok = self._build_context_time_token(inputs)
+        if context_time_tok is not None:
+            ns_parts.append(context_time_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
@@ -2080,8 +2086,14 @@ class PCVRHyFormer(nn.Module):
 
         return torch.cat(ns_parts, dim=1)
 
+    def _build_context_time_token(self, inputs: ModelInput) -> Optional[torch.Tensor]:
+        if not self.use_seq_calendar_features:
+            return None
+        context_time = self._build_time_context(inputs)
+        return self.context_time_token_norm(context_time).unsqueeze(1)
+
     def _build_time_context(self, inputs: ModelInput) -> torch.Tensor:
-        """Build click-time context vector for time-conditioned DIN query."""
+        """构建点击时间的上下文向量，用于 time-conditioned DIN query。"""
         if not self.use_seq_calendar_features:
             return torch.zeros(
                 (inputs.user_int_feats.shape[0], self.d_model),
