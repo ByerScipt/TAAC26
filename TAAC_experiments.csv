@@ -1,0 +1,13 @@
+step,date,experiment,source,key_change,local_auc,local_loss,online_auc,online_delta
+0,2026-04-25,baseline,TAAC2026/main,Official PyTorch baseline,0.86219,0.22466,0.812646,
+1,2026-04-27,bf16_amp,TAAC2026/Speed-up,Enable BF16 mixed precision training,0.86247,0.22444,0.81223,
+2,2026-04-28,recency_dense,TAAC2026/recency_v1,Add per-domain recency and sequence length dense features,0.8619777,0.224132,0.814566,0.001920
+3,2026-04-30,tuple_tokens,TAAC2026/tokenization,Add shared tuple tokenization for fields 62-66,0.864002,0.22274,0.816017,0.001451
+4,2026-05-08,calendar_tokens,TAAC2026/seq_calendar_no_month_year,Add sequence calendar tokens without month-of-year,0.8655957,0.221923,0.821676,0.005659
+5,2026-05-09,time_din,TAAC2026/din_mlp,Condition DIN sequence pooling on current time,0.8666739,0.2227302,0.825175,0.003499
+6,2026-05-10,multi_scale_queries,TAAC2026/multi_scale_time_split,Add short mid and long interest query views,0.867078,0.221575,0.827658,0.002483
+7,2026-05-13,time_tokens,TAAC2026/multi_scale_time_token,Add explicit current-time non-sequence tokens,0.8671137,0.220959,0.828348,0.000690
+8,2026-05-21,core_refactor,TAAC2026/official_recuni_multiscale,Rebuild the core model with validated time and stability modules,0.8675917,0.253418,0.829255,0.000907
+9,2026-05-21,sparse_moe,TAAC2026/sparse_moe_v5,Add token-level sparse MoE routing,0.86811,0.254258,0.829527,0.000272
+10,2026-05-22,feature_tokens,TAAC2026/fancy_tokenization,Add heterogeneous tokenization for dense tuple and quantile-like features,0.869321,0.253492,0.829901,0.000374
+11,2026-05-23,final_no_moe,TAAC2026/fancy_tokenization,Disable sparse MoE by default in the final heterogeneous tokenization model,0.868445,0.255211,0.830774,0.000873
