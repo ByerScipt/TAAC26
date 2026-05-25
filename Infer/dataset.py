@@ -73,6 +73,10 @@ class FeatureSchema:
         """Get ``(offset, length)`` for a feature_id."""
         return self._fid_to_entry[feature_id]
 
+    def has_feature(self, feature_id: int) -> bool:
+        """Return whether this schema contains ``feature_id``."""
+        return feature_id in self._fid_to_entry
+
     @property
     def feature_ids(self) -> List[int]:
         """Return all feature_ids in their insertion order."""

@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -986,6 +986,16 @@ class MultiSeqHyFormerBlock(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _filter_feature_groups(
+    groups: List[List[int]],
+    exclude_feature_indices: Optional[List[int]],
+) -> List[List[int]]:
+    if not exclude_feature_indices:
+        return groups
+    excluded = set(exclude_feature_indices)
+    return [[idx for idx in group if idx not in excluded] for group in groups]
+
+
 class GroupNSTokenizer(nn.Module):
     """NS tokenizer used by ns_tokenizer_type='group'.
 
@@ -996,18 +1006,24 @@ class GroupNSTokenizer(nn.Module):
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+                 emb_skip_threshold: int = 0,
+                 exclude_feature_indices: Optional[List[int]] = None) -> None:
         super().__init__()
         self.feature_specs = feature_specs
-        self.groups = groups
+        self.groups = _filter_feature_groups(groups, exclude_feature_indices)
         self.emb_dim = emb_dim
         self.emb_skip_threshold = emb_skip_threshold
+        self.exclude_feature_indices = set(exclude_feature_indices or [])
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
         embs = []
-        for vs, offset, length in feature_specs:
-            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+        for fid_idx, (vs, offset, length) in enumerate(feature_specs):
+            skip = (
+                fid_idx in self.exclude_feature_indices
+                or int(vs) <= 0
+                or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            )
             if skip:
                 embs.append(None)
             else:
@@ -1026,10 +1042,10 @@ class GroupNSTokenizer(nn.Module):
         # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
         self.group_projs = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(len(group) * emb_dim, d_model),
+                nn.Linear(max(1, len(group) * emb_dim), d_model),
                 nn.LayerNorm(d_model),
             )
-            for group in groups
+            for group in self.groups
         ])
 
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
@@ -1063,7 +1079,10 @@ class GroupNSTokenizer(nn.Module):
                         count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
                         fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
                 fid_embs.append(fid_emb)
-            cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
+            if fid_embs:
+                cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
+            else:
+                cat_emb = int_feats.new_zeros(int_feats.shape[0], 1, dtype=torch.float)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
         return torch.cat(tokens, dim=1)  # (B, num_groups, D)
 
@@ -1084,6 +1103,7 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        exclude_feature_indices: Optional[List[int]] = None,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1097,16 +1117,23 @@ class RankMixerNSTokenizer(nn.Module):
         """
         super().__init__()
         self.feature_specs = feature_specs
-        self.groups = groups
+        self.groups = [group for group in _filter_feature_groups(groups, exclude_feature_indices) if group]
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.exclude_feature_indices = set(exclude_feature_indices or [])
+        if num_ns_tokens <= 0:
+            raise ValueError(f"num_ns_tokens must be positive, got {num_ns_tokens}")
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
         embs = []
-        for vs, offset, length in feature_specs:
-            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+        for fid_idx, (vs, offset, length) in enumerate(feature_specs):
+            skip = (
+                fid_idx in self.exclude_feature_indices
+                or int(vs) <= 0
+                or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            )
             if skip:
                 embs.append(None)
             else:
@@ -1122,8 +1149,10 @@ class RankMixerNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
-        # Compute total embedding dim: sum of all fids across all groups
-        total_num_fids = sum(len(g) for g in groups)
+        # Compute total embedding dim: sum of all active fids across all groups
+        total_num_fids = sum(len(g) for g in self.groups)
+        if total_num_fids == 0:
+            raise ValueError("RankMixerNSTokenizer has no active features after exclusions")
         total_emb_dim = total_num_fids * emb_dim
 
         # Pad total_emb_dim to be divisible by num_ns_tokens
@@ -1190,6 +1219,133 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class SharedFidTupleTokenizer(nn.Module):
+    """Builds one schema-aware token from shared user int+dense fids."""
+
+    def __init__(
+        self,
+        tuple_specs: List[Dict[str, int]],
+        emb_dim: int,
+        d_model: int,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        if not tuple_specs:
+            raise ValueError("SharedFidTupleTokenizer requires at least one tuple spec")
+        self.tuple_specs = tuple_specs
+        self.emb_dim = emb_dim
+        self.d_model = d_model
+        self.emb_skip_threshold = emb_skip_threshold
+        self.fids = [int(spec['fid']) for spec in tuple_specs]
+        self.vocab_sizes = [int(spec['int_vocab_size']) for spec in tuple_specs]
+
+        id_embs = []
+        self._emb_index = []
+        for vocab_size in self.vocab_sizes:
+            skip = int(vocab_size) <= 0 or (
+                emb_skip_threshold > 0 and int(vocab_size) > emb_skip_threshold
+            )
+            if skip:
+                self._emb_index.append(-1)
+            else:
+                self._emb_index.append(len(id_embs))
+                id_embs.append(nn.Embedding(int(vocab_size) + 1, emb_dim, padding_idx=0))
+        self.id_embs = nn.ModuleList(id_embs)
+
+        self.value_projs = nn.ModuleList([
+            nn.Linear(1, emb_dim)
+            for _ in tuple_specs
+        ])
+        self.tuple_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(emb_dim * 2, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for _ in tuple_specs
+        ])
+        self.aggregate_proj = nn.Sequential(
+            nn.Linear(len(tuple_specs) * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self._logged_sanity = False
+
+    def forward(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        fid_tokens = []
+        valid_any = []
+        valid_rates = {}
+        stat_values = []
+
+        for idx, spec in enumerate(self.tuple_specs):
+            fid = int(spec['fid'])
+            int_offset = int(spec['int_offset'])
+            dense_offset = int(spec['dense_offset'])
+            length = int(spec['int_length'])
+            dense_length = int(spec['dense_length'])
+            if length != dense_length:
+                raise ValueError(
+                    f"shared fid {fid} int_length={length} != dense_length={dense_length}"
+                )
+
+            int_ids = user_int_feats[:, int_offset:int_offset + length].long()
+            dense_vals = user_dense_feats[:, dense_offset:dense_offset + length].float()
+            finite_mask = torch.isfinite(dense_vals)
+            mask = (int_ids > 0) & finite_mask
+
+            value = torch.sign(dense_vals) * torch.log1p(torch.abs(dense_vals))
+            value = torch.clamp(value, min=-20.0, max=20.0)
+            value = torch.where(finite_mask, value, torch.zeros_like(value))
+
+            emb_real_idx = self._emb_index[idx]
+            if emb_real_idx == -1:
+                id_emb = user_int_feats.new_zeros(
+                    int_ids.shape[0], int_ids.shape[1], self.emb_dim, dtype=torch.float
+                )
+            else:
+                id_emb = self.id_embs[emb_real_idx](int_ids)
+            value_emb = self.value_projs[idx](value.unsqueeze(-1))
+            tuple_emb = F.silu(self.tuple_projs[idx](torch.cat([id_emb, value_emb], dim=-1)))
+
+            mask_f = mask.unsqueeze(-1).to(tuple_emb.dtype)
+            tuple_emb = tuple_emb * mask_f
+            count = mask_f.sum(dim=1).clamp(min=1.0)
+            fid_tokens.append(tuple_emb.sum(dim=1) / count)
+            valid_any.append(mask.any(dim=1, keepdim=True))
+
+            if not self._logged_sanity:
+                valid_rates[fid] = float(mask.float().mean().detach().cpu().item())
+                if mask.any():
+                    stat_values.append(value[mask].detach().float())
+
+        cat = torch.cat(fid_tokens, dim=-1)
+        shared_token = F.silu(self.aggregate_proj(cat)).unsqueeze(1)
+        any_valid = torch.stack(valid_any, dim=0).any(dim=0).to(shared_token.dtype).unsqueeze(-1)
+        shared_token = shared_token * any_valid
+
+        if not self._logged_sanity:
+            if stat_values:
+                stats = torch.cat(stat_values, dim=0)
+            else:
+                stats = shared_token.new_zeros(1).detach().float()
+            nan_count = int(torch.isnan(stats).sum().item())
+            inf_count = int(torch.isinf(stats).sum().item())
+            logging.info(
+                "shared_fid_tuple_token sanity: "
+                f"shape={tuple(shared_token.shape)} "
+                f"tuple_valid_rate_per_fid={valid_rates} "
+                f"transformed_dense_min={stats.min().item():.6f} "
+                f"transformed_dense_max={stats.max().item():.6f} "
+                f"transformed_dense_mean={stats.mean().item():.6f} "
+                f"nan_count={nan_count} inf_count={inf_count}"
+            )
+            self._logged_sanity = True
+
+        return shared_token
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1232,6 +1388,10 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         use_engineered_dense_features: bool = True,
         engineered_dense_dim: int = 24,
+        use_shared_fid_tuple_token: bool = False,
+        shared_fids: Optional[Union[str, List[int]]] = None,
+        shared_fid_tuple_mode: str = 'replace',
+        shared_fid_tuple_specs: Optional[List[Dict[str, int]]] = None,
     ) -> None:
         super().__init__()
 
@@ -1249,6 +1409,53 @@ class PCVRHyFormer(nn.Module):
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_engineered_dense_features = use_engineered_dense_features
         self.engineered_dense_dim = engineered_dense_dim if use_engineered_dense_features else 0
+        self.use_shared_fid_tuple_token = use_shared_fid_tuple_token
+        self.shared_fid_tuple_mode = shared_fid_tuple_mode
+        if shared_fid_tuple_mode not in ('replace', 'additive'):
+            raise ValueError(
+                f"shared_fid_tuple_mode must be replace/additive, got {shared_fid_tuple_mode}"
+            )
+        self.shared_fids = (
+            [int(fid) for fid in shared_fids.split(',') if fid.strip()]
+            if isinstance(shared_fids, str)
+            else [int(fid) for fid in (shared_fids or [])]
+        )
+        self.shared_fid_tuple_specs = shared_fid_tuple_specs or []
+        self.shared_fid_tuple_token_count = 1 if use_shared_fid_tuple_token else 0
+        if self.use_shared_fid_tuple_token and not self.shared_fid_tuple_specs:
+            raise ValueError("shared_fid_tuple_specs is required when use_shared_fid_tuple_token=True")
+        shared_int_feature_indices = (
+            [int(spec['int_feature_idx']) for spec in self.shared_fid_tuple_specs]
+            if self.use_shared_fid_tuple_token and shared_fid_tuple_mode == 'replace'
+            else []
+        )
+        shared_dense_slices = (
+            [(int(spec['dense_offset']), int(spec['dense_length'])) for spec in self.shared_fid_tuple_specs]
+            if self.use_shared_fid_tuple_token and shared_fid_tuple_mode == 'replace'
+            else []
+        )
+        self.original_shared_fids_still_in_generic_tokens = (
+            bool(self.use_shared_fid_tuple_token)
+            and shared_fid_tuple_mode == 'additive'
+        )
+
+        if self.use_shared_fid_tuple_token:
+            self.shared_fid_tuple_tokenizer = SharedFidTupleTokenizer(
+                tuple_specs=self.shared_fid_tuple_specs,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+        else:
+            self.shared_fid_tuple_tokenizer = None
+        logging.info(f"use_shared_fid_tuple_token={self.use_shared_fid_tuple_token}")
+        logging.info(f"shared_fids={self.shared_fids}")
+        logging.info(f"shared_fid_tuple_mode={self.shared_fid_tuple_mode}")
+        logging.info(
+            "original_shared_fids_still_in_generic_tokens="
+            f"{self.original_shared_fids_still_in_generic_tokens}"
+        )
+        logging.info(f"tuple token count={self.shared_fid_tuple_token_count}")
 
         # ================== NS Tokens Construction ==================
 
@@ -1260,6 +1467,7 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                exclude_feature_indices=shared_int_feature_indices,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1278,15 +1486,20 @@ class PCVRHyFormer(nn.Module):
                 user_ns_tokens = len(user_ns_groups)
             if item_ns_tokens <= 0:
                 item_ns_tokens = len(item_ns_groups)
+            generic_user_ns_tokens = user_ns_tokens
+            if self.use_shared_fid_tuple_token and shared_fid_tuple_mode == 'replace':
+                generic_user_ns_tokens = max(
+                    1, user_ns_tokens - self.shared_fid_tuple_token_count)
             self.user_ns_tokenizer = RankMixerNSTokenizer(
                 feature_specs=user_int_feature_specs,
                 groups=user_ns_groups,
                 emb_dim=emb_dim,
                 d_model=d_model,
-                num_ns_tokens=user_ns_tokens,
+                num_ns_tokens=generic_user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                exclude_feature_indices=shared_int_feature_indices,
             )
-            num_user_ns = user_ns_tokens
+            num_user_ns = generic_user_ns_tokens
 
             self.item_ns_tokenizer = RankMixerNSTokenizer(
                 feature_specs=item_int_feature_specs,
@@ -1307,6 +1520,15 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            if shared_dense_slices:
+                mask = torch.ones(user_dense_dim, dtype=torch.float32)
+                for offset, length in shared_dense_slices:
+                    mask[offset:offset + length] = 0.0
+                self.register_buffer('user_dense_generic_mask', mask, persistent=False)
+            else:
+                self.user_dense_generic_mask = None
+        else:
+            self.user_dense_generic_mask = None
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
@@ -1317,7 +1539,8 @@ class PCVRHyFormer(nn.Module):
             )
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
+        self.num_ns = (num_user_ns + self.shared_fid_tuple_token_count
+                       + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
@@ -1477,6 +1700,11 @@ class PCVRHyFormer(nn.Module):
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
+        if self.shared_fid_tuple_tokenizer is not None:
+            for emb in self.shared_fid_tuple_tokenizer.id_embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
@@ -1526,6 +1754,21 @@ class PCVRHyFormer(nn.Module):
                 if real_idx == -1:
                     continue
                 emb = tokenizer.embs[real_idx]
+                if int(vs) > cardinality_threshold:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+                else:
+                    skip_count += 1
+
+        if self.shared_fid_tuple_tokenizer is not None:
+            tokenizer = self.shared_fid_tuple_tokenizer
+            for i, vs in enumerate(tokenizer.vocab_sizes):
+                real_idx = tokenizer._emb_index[i]
+                if real_idx == -1:
+                    continue
+                emb = tokenizer.id_embs[real_idx]
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
                     emb.weight.data[0, :] = 0
@@ -1657,22 +1900,36 @@ class PCVRHyFormer(nn.Module):
         eng = self.engineered_proj(engineered_dense_feats.float())
         return output + self.engineered_alpha * eng
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
+    def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
+        if self.shared_fid_tuple_tokenizer is not None:
+            ns_parts.append(self.shared_fid_tuple_tokenizer(
+                inputs.user_int_feats,
+                inputs.user_dense_feats,
+            ))
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_feats = inputs.user_dense_feats
+            if self.user_dense_generic_mask is not None:
+                user_dense_feats = user_dense_feats * self.user_dense_generic_mask.to(
+                    device=user_dense_feats.device,
+                    dtype=user_dense_feats.dtype,
+                )
+            user_dense_tok = F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
 
-        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        return torch.cat(ns_parts, dim=1)
+
+    def forward(self, inputs: ModelInput) -> torch.Tensor:
+        """Runs the forward pass of the PCVRHyFormer model."""
+        # 1. NS tokens: generic user/item tokens plus optional shared-fid tuple token.
+        ns_tokens = self._build_ns_tokens(inputs)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1704,19 +1961,7 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
+        ns_tokens = self._build_ns_tokens(inputs)
 
         seq_tokens_list = []
         seq_masks_list = []

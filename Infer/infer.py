@@ -70,6 +70,9 @@ _FALLBACK_MODEL_CFG = {
     'item_ns_tokens': 0,
     'use_engineered_dense_features': True,
     'engineered_dense_dim': ENGINEERED_DENSE_DIM,
+    'use_shared_fid_tuple_token': False,
+    'shared_fids': [62, 63, 64, 65, 66],
+    'shared_fid_tuple_mode': 'replace',
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -93,6 +96,50 @@ def build_feature_specs(
     for fid, offset, length in schema.entries:
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
+    return specs
+
+
+def parse_shared_fids(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [int(fid) for fid in value]
+    if isinstance(value, tuple):
+        return [int(fid) for fid in value]
+    return [int(fid.strip()) for fid in str(value).split(',') if fid.strip()]
+
+
+def build_shared_fid_tuple_specs(
+    user_int_schema: FeatureSchema,
+    user_int_vocab_sizes: List[int],
+    user_dense_schema: FeatureSchema,
+    shared_fids: List[int],
+) -> List[Dict[str, int]]:
+    user_fid_to_idx = {
+        fid: i for i, (fid, _, _) in enumerate(user_int_schema.entries)
+    }
+    specs: List[Dict[str, int]] = []
+    for fid in shared_fids:
+        if not user_int_schema.has_feature(fid):
+            raise KeyError(f"shared fid {fid} not found in user_int schema")
+        if not user_dense_schema.has_feature(fid):
+            raise KeyError(f"shared fid {fid} not found in user_dense schema")
+        int_offset, int_length = user_int_schema.get_offset_length(fid)
+        dense_offset, dense_length = user_dense_schema.get_offset_length(fid)
+        if int_length != dense_length:
+            raise ValueError(
+                f"shared fid {fid} int_length={int_length} != dense_length={dense_length}"
+            )
+        int_vocab_size = max(user_int_vocab_sizes[int_offset:int_offset + int_length])
+        specs.append({
+            "fid": fid,
+            "int_feature_idx": user_fid_to_idx[fid],
+            "int_offset": int_offset,
+            "int_length": int_length,
+            "int_vocab_size": int_vocab_size,
+            "dense_offset": dense_offset,
+            "dense_length": dense_length,
+        })
     return specs
 
 
@@ -221,6 +268,28 @@ def build_model(
         dataset.user_int_schema, dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
+    shared_fids = parse_shared_fids(model_cfg.get('shared_fids', []))
+    model_cfg = dict(model_cfg)
+    model_cfg['shared_fids'] = shared_fids
+    shared_fid_tuple_specs: List[Dict[str, int]] = []
+    if model_cfg.get('use_shared_fid_tuple_token', False):
+        shared_fid_tuple_specs = build_shared_fid_tuple_specs(
+            dataset.user_int_schema,
+            dataset.user_int_vocab_sizes,
+            dataset.user_dense_schema,
+            shared_fids,
+        )
+        logging.info(f"use_shared_fid_tuple_token={model_cfg['use_shared_fid_tuple_token']}")
+        logging.info(f"shared_fids={shared_fids}")
+        logging.info(f"shared_fid_tuple_mode={model_cfg.get('shared_fid_tuple_mode')}")
+        for spec in shared_fid_tuple_specs:
+            logging.info(
+                "shared_fid_tuple spec: "
+                f"fid={spec['fid']} "
+                f"int_offset={spec['int_offset']} int_length={spec['int_length']} "
+                f"dense_offset={spec['dense_offset']} dense_length={spec['dense_length']}"
+            )
+    logging.info(f"tuple token count={1 if model_cfg.get('use_shared_fid_tuple_token', False) else 0}")
 
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
@@ -231,8 +300,13 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
+        shared_fid_tuple_specs=shared_fid_tuple_specs,
         **model_cfg,
     ).to(device)
+
+    num_sequences = len(dataset.seq_domains)
+    total_tokens = int(model_cfg['num_queries']) * num_sequences + model.num_ns
+    logging.info(f"final num_ns={model.num_ns}, total token count T={total_tokens}")
 
     return model
 

@@ -1,7 +1,8 @@
-"""PCVRHyFormer pointwise trainer (binary-classification, AUC-monitored).
+"""PCVRHyFormer 的训练循环。
 
-Despite the historical "Ranking" suffix in the class name, the training loop
-uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
+这里负责把 DataLoader 产出的 batch 送进模型、计算 loss、反向传播、验证 AUC，
+并保存最优 checkpoint。类名里保留了历史上的 "Ranking" 后缀，实际训练目标是
+pointwise 二分类。
 """
 
 import os
@@ -24,16 +25,16 @@ from model import ModelInput
 
 
 class PCVRHyFormerRankingTrainer:
-    """PCVRHyFormer trainer for pointwise binary classification.
+    """封装一次完整的 pointwise 二分类训练。
 
-    Uses PCVR data layout:
+    batch 中的主要字段如下：
     - user_int_feats, user_dense_feats
     - item_int_feats, item_dense_feats
-    - seq_a, seq_b, seq_c, seq_d (each with *_len companion)
-    - label (binary)
+    - seq_a, seq_b, seq_c, seq_d，以及每一路对应的 *_len 和 *_time_bucket
+    - engineered_dense_feats
+    - label
 
-    Loss: BCEWithLogitsLoss or Focal Loss.
-    Metrics: BinaryAUROC + binary logloss.
+    训练 loss 支持 BCEWithLogitsLoss 和 Focal Loss；验证指标是 AUC 和 logloss。
     """
 
     def __init__(
@@ -67,16 +68,12 @@ class PCVRHyFormerRankingTrainer:
         self.train_loader: DataLoader = train_loader
         self.valid_loader: DataLoader = valid_loader
         self.writer = writer
-        # schema_path is copied alongside every checkpoint so that infer.py can
-        # rebuild the exact same feature schema the model was trained with.
+        # checkpoint 旁边会复制 schema.json，infer.py 用它还原训练时的特征布局。
         self.schema_path: Optional[str] = schema_path
-        # ns_groups_path is optional; copied next to schema.json when provided
-        # and points at an existing file. Keeping the JSON inside the ckpt dir
-        # makes the checkpoint self-contained for evaluation environments that
-        # do not ship ns_groups.json separately.
+        # 如果使用 ns_groups.json，也复制到 checkpoint 目录，保证 checkpoint 自包含。
         self.ns_groups_path: Optional[str] = ns_groups_path
 
-        # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
+        # Embedding 参数和稠密网络参数分开优化：前者用 Adagrad，后者用 AdamW。
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
@@ -132,8 +129,9 @@ class PCVRHyFormerRankingTrainer:
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
-        """Build a checkpoint sub-directory name such as
-        ``global_step2500.layer=2.head=4.hidden=64[.best_model]``.
+        """根据 global step 和模型关键配置生成 checkpoint 子目录名。
+
+        例子：``global_step2500.layer=2.head=4.hidden=64.best_model``。
         """
         parts = [f"global_step{global_step}"]
         for key in ("layer", "head", "hidden"):
@@ -145,23 +143,17 @@ class PCVRHyFormerRankingTrainer:
         return name
 
     def _write_sidecar_files(self, ckpt_dir: str) -> None:
-        """Write sidecar files next to a ``model.pt``.
+        """把推理所需的配置文件写到 checkpoint 目录。
 
-        Currently persists up to three files, all overwritten on every call:
+        ``model.pt`` 只包含参数。为了让 infer.py 能构建同样的数据 schema 和模型
+        配置，这里额外保存：
 
-        - ``schema.json`` (copied from ``self.schema_path``): feature layout
-          metadata needed to rebuild the Parquet dataset.
-        - ``ns_groups.json`` (copied from ``self.ns_groups_path`` when set
-          and the file exists): NS-token grouping used to construct the
-          tokenizer. Making a per-ckpt copy lets evaluation environments
-          consume the checkpoint without having to ship the original
-          project-level ``ns_groups.json``.
-        - ``train_config.json`` (serialized from ``self.train_config``):
-          full set of training-time hyperparameters. When ``ns_groups.json``
-          is copied into ``ckpt_dir``, the ``ns_groups_json`` field is
-          rewritten to the bare filename so that ``infer.py`` resolves it
-          against ``ckpt_dir`` rather than the original absolute path on
-          the training machine.
+        - ``schema.json``：特征布局。
+        - ``ns_groups.json``：NS token 分组配置。
+        - ``train_config.json``：训练时的命令行参数和模型开关。
+
+        当 ``ns_groups.json`` 被复制进 checkpoint 目录时，``train_config.json`` 里
+        的路径会改写成文件名，方便在不同机器上移动 checkpoint。
         """
         os.makedirs(ckpt_dir, exist_ok=True)
         if self.schema_path and os.path.exists(self.schema_path):
@@ -176,10 +168,7 @@ class PCVRHyFormerRankingTrainer:
             import json
             cfg_to_dump = self.train_config
             if ns_groups_copied:
-                # Override the stored path to a filename relative to ckpt_dir;
-                # infer.py already falls back to `<ckpt_dir>/<basename>` when
-                # the recorded path is not absolute, which keeps the ckpt
-                # portable across hosts.
+                # 保存相对文件名，infer.py 会在 checkpoint 目录下解析它。
                 cfg_to_dump = dict(self.train_config)
                 cfg_to_dump['ns_groups_json'] = os.path.basename(
                     self.ns_groups_path)
@@ -192,17 +181,16 @@ class PCVRHyFormerRankingTrainer:
         is_best: bool = False,
         skip_model_file: bool = False,
     ) -> str:
-        """Save ``model.pt`` plus sidecar files under a ``global_step`` sub-dir.
+        """保存一个 step checkpoint。
 
-        Args:
-            global_step: current global step used to name the directory.
-            is_best: whether this is a new-best checkpoint.
-            skip_model_file: if True, skip writing ``model.pt`` (because the
-                caller, e.g. EarlyStopping, has already persisted it to the
-                same path). Sidecar files are still (re)written.
+        参数：
+            global_step: 当前训练 step。
+            is_best: 是否在目录名后追加 ``.best_model``。
+            skip_model_file: EarlyStopping 已经写出 ``model.pt`` 时设为 True，只补写
+                schema/config 等配套文件。
 
-        Returns:
-            The absolute path of the checkpoint directory.
+        返回：
+            checkpoint 目录路径。
         """
         dir_name = self._build_step_dir_name(global_step, is_best=is_best)
         ckpt_dir = os.path.join(self.save_dir, dir_name)
@@ -214,19 +202,17 @@ class PCVRHyFormerRankingTrainer:
         return ckpt_dir
 
     def _remove_old_best_dirs(self) -> None:
-        """Delete stale ``*.best_model`` directories so that only the latest
-        best checkpoint is kept on disk.
-        """
+        """删除旧 best_model 目录，磁盘上只保留当前最优模型。"""
         pattern = os.path.join(self.save_dir, "global_step*.best_model")
         for old_dir in glob.glob(pattern):
             shutil.rmtree(old_dir)
             logging.info(f"Removed old best_model dir: {old_dir}")
 
     def _batch_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Move only forward/eval tensors to ``self.device``.
+        """把模型会用到的 tensor 移到训练设备。
 
-        Raw metadata such as ``timestamp`` and ``user_id`` stays on CPU because
-        the model forward path does not consume it.
+        batch 中还有 ``timestamp``、``user_id`` 等元信息，这些字段不参与 forward，
+        保持在 CPU 可以减少无意义的数据搬运。
         """
         seq_domains = batch['_seq_domains']
         needed_tensor_keys = {
@@ -275,28 +261,13 @@ class PCVRHyFormerRankingTrainer:
         val_auc: float,
         val_logloss: float,
     ) -> None:
-        """Persist a new-best checkpoint atomically.
+        """处理一次验证结果，并在出现新最佳时保存 checkpoint。
 
-        Flow (ordered to avoid leaving empty sidecar-only directories on disk):
+        这里先判断本次 AUC 是否有机会刷新最佳值。只有有机会刷新时，才会清理旧的
+        ``best_model`` 目录并让 EarlyStopping 写 ``model.pt``。确认模型文件已经
+        写出后，再补写 schema 和 config，避免出现只有配置文件、没有模型参数的目录。
 
-        1. Decide whether ``val_auc`` is *likely* to beat the current best
-           using the same threshold as ``EarlyStopping._is_not_improved``,
-           so our pre-cleanup and EarlyStopping's internal save decision
-           stay in sync.
-        2. If unlikely, short-circuit: do nothing on disk. We must NOT
-           touch ``self.early_stopping.checkpoint_path`` or call
-           ``_write_sidecar_files`` because the target directory may not
-           exist yet (sidecar-only dirs would otherwise be created here,
-           producing checkpoints with missing ``model.pt``).
-        3. If likely, point ``EarlyStopping`` at the canonical
-           ``global_stepN.best_model/model.pt`` path, remove any stale
-           ``*.best_model`` dirs, then run ``EarlyStopping`` (which writes
-           ``model.pt`` when it actually confirms a new best).
-        4. Only after ``EarlyStopping`` has confirmed a new best
-           (``best_score != old_best``) do we write the sidecar files into
-           the freshly-created directory; this is guarded so that a
-           razor-close score that tripped ``is_likely_new_best`` but not
-           ``EarlyStopping``'s own gate does not create a stray dir.
+        这种顺序让 checkpoint 目录始终保持可推理状态。
         """
         old_best = self.early_stopping.best_score
         is_likely_new_best = (
@@ -304,25 +275,21 @@ class PCVRHyFormerRankingTrainer:
             or val_auc > old_best + self.early_stopping.delta
         )
         if not is_likely_new_best:
-            # No new best anticipated: leave disk untouched. The previous
-            # best_model dir (with its model.pt + sidecars) remains valid.
+            # 本次分数不会刷新最佳值，磁盘上的现有 best_model 保持不动。
             self.early_stopping(val_auc, self.model, {
                 "best_val_AUC": val_auc,
                 "best_val_logloss": val_logloss,
             })
             return
 
-        # Point EarlyStopping at the canonical best-model location for this
-        # step. Only done on the likely-new-best branch so that a skipped
-        # save never leaks the unused path into EarlyStopping state.
+        # 当前 step 有机会刷新最佳值，先把 EarlyStopping 的输出路径切到规范目录。
         best_dir = os.path.join(
             self.save_dir,
             self._build_step_dir_name(total_step, is_best=True),
         )
         self.early_stopping.checkpoint_path = os.path.join(best_dir, "model.pt")
 
-        # Remove stale best dirs first so EarlyStopping's write is the only
-        # I/O needed when a new best is confirmed.
+        # 先清理旧 best 目录，随后由 EarlyStopping 写入新的 model.pt。
         self._remove_old_best_dirs()
 
         self.early_stopping(val_auc, self.model, {
@@ -330,10 +297,7 @@ class PCVRHyFormerRankingTrainer:
             "best_val_logloss": val_logloss,
         })
 
-        # Write sidecar files only when EarlyStopping actually confirmed a
-        # new best and wrote model.pt. If the score tripped our heuristic
-        # but EarlyStopping internally declined to save, skip to avoid
-        # creating an empty (sidecar-only) checkpoint directory.
+        # 确认 model.pt 存在后再补写配套文件，保证目录可以直接用于推理。
         if self.early_stopping.best_score != old_best and os.path.exists(
             self.early_stopping.checkpoint_path
         ):
@@ -349,7 +313,7 @@ class PCVRHyFormerRankingTrainer:
         samples: int,
         steps: int,
     ) -> None:
-        """Log interval-level training throughput and timing."""
+        """记录最近一段 step 的吞吐、耗时和显存峰值。"""
         if steps <= 0:
             return
         samples_per_sec = samples / step_time_sum if step_time_sum > 0 else 0.0
@@ -371,9 +335,11 @@ class PCVRHyFormerRankingTrainer:
             torch.cuda.reset_peak_memory_stats(self.device)
 
     def train(self) -> None:
-        """Main training loop: iterates over epochs, performs step-level and
-        epoch-level validation, triggers EarlyStopping and the periodic sparse
-        re-initialization strategy.
+        """执行完整训练流程。
+
+        每个 batch 会依次经过：搬到设备、构造 ``ModelInput``、forward、loss、
+        backward、梯度裁剪、两个 optimizer 更新。验证可以按 step 触发，也可以在
+        每个 epoch 结束后触发。
         """
         print("Start training (PCVRHyFormer)")
         self.model.train()
@@ -442,7 +408,7 @@ class PCVRHyFormerRankingTrainer:
                     )
                     return
 
-                # Step-level validation (only when eval_every_n_steps > 0).
+                # step 级验证，用于较长 epoch 中提前观察 AUC 曲线。
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
                     logging.info(f"Evaluating at step {total_step}")
                     val_auc, val_logloss = self.evaluate(epoch=epoch)
@@ -479,14 +445,13 @@ class PCVRHyFormerRankingTrainer:
                 logging.info(f"Early stopping at epoch {epoch}")
                 break
 
-            # After the configured epoch, reinitialize high-cardinality sparse
-            # params (Embeddings) as a form of cold restart to reduce overfit.
-            # Reference: KuaiShou Tech., "MultiEpoch: Reusing Training Data
-            # for Click-Through Rate Prediction",
-            # https://arxiv.org/pdf/2305.19531
+            # 达到配置 epoch 后，周期性重置高基数 Embedding，降低 ID 特征过拟合。
+            # 参考：
+            # KuaiShou Tech., "MultiEpoch: Reusing Training Data for
+            # Click-Through Rate Prediction", https://arxiv.org/pdf/2305.19531
             if epoch >= self.reinit_sparse_after_epoch and self.sparse_optimizer is not None:
-                # Snapshot Adagrad state per parameter via data_ptr, so state
-                # of low-cardinality embeddings can be preserved across rebuild.
+                # 按参数地址保存 Adagrad 状态。高基数 Embedding 会被重置，低基数
+                # Embedding 的优化器状态会在新 optimizer 上恢复。
                 old_state: Dict[int, Any] = {}
                 for group in self.sparse_optimizer.param_groups:
                     for p in group['params']:
@@ -498,7 +463,7 @@ class PCVRHyFormerRankingTrainer:
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
-                # Restore optimizer state for low-cardinality embeddings only.
+                # 重建后只恢复未重置参数的优化器状态。
                 restored = 0
                 for p in sparse_params:
                     if p.data_ptr() not in reinit_ptrs and p.data_ptr() in old_state:
@@ -508,7 +473,7 @@ class PCVRHyFormerRankingTrainer:
                              f"restored optimizer state for {restored} low-cardinality params")
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
-        """Construct a ``ModelInput`` NamedTuple from a device_batch dict."""
+        """把 batch 字典整理成模型 forward 需要的 ``ModelInput``。"""
         seq_domains = device_batch['_seq_domains']
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
@@ -533,7 +498,7 @@ class PCVRHyFormerRankingTrainer:
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> Tuple[float, float, float, float, int]:
-        """Run a single training step and return loss plus lightweight timings."""
+        """执行一个训练 step，并返回 loss、耗时和样本数。"""
         step_t0 = time.perf_counter()
         move_t0 = time.perf_counter()
         device_batch = self._batch_to_device(batch)
@@ -562,8 +527,7 @@ class PCVRHyFormerRankingTrainer:
             else:
                 loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
+        # foreach=False 是本项目的稳定性设置，避免特定形状下的 CUDA kernel 异常。
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
         self.dense_optimizer.step()
@@ -575,10 +539,9 @@ class PCVRHyFormerRankingTrainer:
         return loss.item(), step_time, batch_to_device_time, fwd_bwd_opt_time, sample_count
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
-        """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
+        """跑完整个验证集，返回 AUC 和 logloss。
 
-        NaN predictions (which can arise from exploding gradients) are filtered
-        out before computing both metrics.
+        指标计算前会过滤 NaN 预测，避免一次异常 batch 让整次验证报错。
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
         self.model.eval()
@@ -599,11 +562,11 @@ class PCVRHyFormerRankingTrainer:
         all_logits = torch.cat(all_logits_list, dim=0).float()
         all_labels = torch.cat(all_labels_list, dim=0).long()
 
-        # Binary AUC via sklearn.
+        # sklearn 负责计算二分类 AUC。
         probs = torch.sigmoid(all_logits).numpy()
         labels_np = all_labels.numpy()
 
-        # Filter NaN predictions (may appear if gradients explode).
+        # 过滤 NaN 预测。
         nan_mask = np.isnan(probs)
         if nan_mask.any():
             n_nan = int(nan_mask.sum())
@@ -617,7 +580,7 @@ class PCVRHyFormerRankingTrainer:
         else:
             auc = float(roc_auc_score(labels_np, probs))
 
-        # Binary logloss (same NaN filtering).
+        # logloss 使用和 AUC 一致的 NaN 过滤口径。
         valid_logits = all_logits[~torch.isnan(all_logits)]
         valid_labels = all_labels[~torch.isnan(all_logits)]
         if len(valid_logits) > 0:
@@ -630,7 +593,7 @@ class PCVRHyFormerRankingTrainer:
     def _evaluate_step(
         self, batch: Dict[str, Any]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run a single validation step and return ``(logits, labels)``."""
+        """执行一个验证 step，返回当前 batch 的 logits 和 labels。"""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label']
 
