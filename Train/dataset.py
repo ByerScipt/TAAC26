@@ -487,7 +487,11 @@ class PCVRParquetDataset(IterableDataset):
             if raw_len <= 0:
                 continue
             use_len = min(raw_len, max_dim)
-            padded[i, :use_len] = values[start:start + use_len]
+            slice_vals = values[start:start + use_len]
+            # Guard against upstream dirty float payloads (NaN/Inf) that can
+            # poison model activations and training loss.
+            slice_vals = np.where(np.isfinite(slice_vals), slice_vals, 0.0)
+            padded[i, :use_len] = slice_vals
 
         return padded
 

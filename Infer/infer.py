@@ -99,6 +99,14 @@ def build_feature_specs(
     return specs
 
 
+def build_shared_fid_tuple_specs(schema: FeatureSchema) -> List[Tuple[int, int, int]]:
+    """Build shared dense feature specs in the same shape as training."""
+    specs: List[Tuple[int, int, int]] = []
+    for fid, offset, length in schema.entries:
+        specs.append((fid, offset, length))
+    return specs
+
+
 def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
     """Parse a string like ``'seq_a:256,seq_b:256,...'`` into a dict."""
     seq_max_lens: Dict[str, int] = {}
@@ -224,6 +232,7 @@ def build_model(
         dataset.user_int_schema, dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
+    user_dense_feature_specs = build_shared_fid_tuple_specs(dataset.user_dense_schema)
 
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
@@ -234,6 +243,7 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
+        user_dense_feature_specs=user_dense_feature_specs,
         **model_cfg,
     ).to(device)
 

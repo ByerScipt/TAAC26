@@ -1322,6 +1322,155 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class QuantileTrackAggregator(nn.Module):
+    """Encode quantile tracks into one stable dense representation."""
+
+    def __init__(self, channels: int, output_dim: int) -> None:
+        super().__init__()
+        hidden = max(16, output_dim // 2)
+        self.conv1 = nn.Conv1d(channels, hidden, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden, output_dim, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.norm = nn.LayerNorm(output_dim)
+
+        # Keep quantile branch weak at init for stable early training.
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        z = F.silu(self.conv1(z))
+        z = self.conv2(z)
+        z = self.pool(z).squeeze(-1)
+        return self.norm(z)
+
+
+class UserDenseFusionTokenizer(nn.Module):
+    """Create one NS token from 4 typed user-dense groups."""
+
+    FID_GROUPS = {
+        "stat_bucket": (62, 63, 64, 65, 66),
+        "quantile_rank": (89, 90, 91),
+        "sum_embed": (61,),
+        "ads_embed": (87,),
+    }
+
+    def __init__(
+        self,
+        dense_specs: List[Tuple[int, int, int]],
+        d_model: int,
+        fallback_input_dim: int,
+    ) -> None:
+        super().__init__()
+        self._d = d_model
+        self._slice = {fid: (offset, length) for fid, offset, length in dense_specs}
+
+        self._fallback_dense = nn.Sequential(
+            nn.Linear(fallback_input_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self._use_fallback_only = len(dense_specs) == 0
+
+        self._ranges = {
+            name: [self._slice[f] for f in fids if f in self._slice]
+            for name, fids in self.FID_GROUPS.items()
+        }
+
+        sum_dim = sum(w for _, w in self._ranges["sum_embed"])
+        ads_dim = sum(w for _, w in self._ranges["ads_embed"])
+        stat_dim = sum(w for _, w in self._ranges["stat_bucket"])
+        q_width = [w for _, w in self._ranges["quantile_rank"]]
+        self._quantile_width = max(q_width) if len(q_width) > 0 else 10
+
+        self._q_offsets = [self._slice[f][0] if f in self._slice else -1 for f in self.FID_GROUPS["quantile_rank"]]
+        self._q_lengths = [self._slice[f][1] if f in self._slice else 0 for f in self.FID_GROUPS["quantile_rank"]]
+        
+        self._sum_head = self._make_head(sum_dim)
+        self._ads_head = self._make_head(ads_dim)
+        self._stat_head = self._make_head(stat_dim)
+        self._quantile_head = QuantileTrackAggregator(
+            channels=len(self.FID_GROUPS["quantile_rank"]),
+            output_dim=d_model,
+        )
+        
+        self._fuse_proj = nn.Sequential(
+            nn.Linear(d_model * 4, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def _make_head(self, width: int) -> Optional[nn.Module]:
+        if width <= 0:
+            return None
+        return nn.Sequential(
+            nn.Linear(width, self._d),
+            nn.LayerNorm(self._d),
+        )
+
+    @staticmethod
+    def _collect_by_mask(x: torch.Tensor, spans: List[Tuple[int, int]]) -> torch.Tensor:
+        if len(spans) == 0:
+            return x.new_zeros(x.shape[0], 0)
+        pieces: List[torch.Tensor] = []
+        for start, width in spans:
+            index = torch.arange(start, start + width, device=x.device)
+            pieces.append(torch.index_select(x, dim=1, index=index))
+        return torch.cat(pieces, dim=1)
+
+    def _zero(self, x: torch.Tensor) -> torch.Tensor:
+        return x.new_zeros(x.shape[0], self._d)
+
+    def _pack_quantile_tracks(self, x: torch.Tensor) -> torch.Tensor:
+        base = x.new_zeros(x.shape[0], len(self._q_offsets), self._quantile_width)
+        for i in range(len(self._q_offsets)):
+            off = self._q_offsets[i]
+            ln = self._q_lengths[i]
+            if off < 0 or ln <= 0:
+                continue
+            raw = x[:, off:off + ln]
+            copy_len = min(ln, self._quantile_width)
+            base[:, i, :copy_len] = raw[:, :copy_len]
+        return base
+
+    def forward(self, user_dense: torch.Tensor) -> torch.Tensor:
+        # Defensive cleanup in case non-finite payload slips past data pipeline.
+        user_dense = torch.nan_to_num(user_dense, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if self._use_fallback_only:
+            return F.silu(self._fallback_dense(user_dense)).unsqueeze(1)
+
+        # intentionally process in non-source order: stat -> quantile -> ads -> sum
+        if self._stat_head is not None and len(self._ranges["stat_bucket"]) > 0:
+            stat_v = self._collect_by_mask(user_dense, self._ranges["stat_bucket"])
+            # Keep clamp/log transform in FP32 to avoid AMP fp16 overflow
+            # (1.5e9 exceeds fp16 finite range and can become inf before log1p).
+            stat_fp32 = stat_v.float()
+            stat_fp32 = torch.clamp(stat_fp32, min=0.0, max=1_500_000_000.0)
+            stat_fp32 = torch.log1p(stat_fp32)
+            stat_v = stat_fp32.to(dtype=stat_v.dtype)
+            stat_repr = F.silu(self._stat_head(stat_v))
+        else:
+            stat_repr = self._zero(user_dense)
+
+        quantile_repr = F.silu(self._quantile_head(self._pack_quantile_tracks(user_dense)))
+
+        if self._ads_head is not None and len(self._ranges["ads_embed"]) > 0:
+            ads_v = self._collect_by_mask(user_dense, self._ranges["ads_embed"])
+            ads_v = F.normalize(ads_v, p=2, dim=-1, eps=1e-6)
+            ads_repr = F.silu(self._ads_head(ads_v))
+        else:
+            ads_repr = self._zero(user_dense)
+
+        if self._sum_head is not None and len(self._ranges["sum_embed"]) > 0:
+            sum_v = self._collect_by_mask(user_dense, self._ranges["sum_embed"])
+            sum_v = F.normalize(sum_v, p=2, dim=-1, eps=1e-6)
+            sum_repr = F.silu(self._sum_head(sum_v))
+        else:
+            sum_repr = self._zero(user_dense)
+
+        merged = torch.cat([sum_repr, ads_repr, stat_repr, quantile_repr], dim=-1)
+        token = self._fuse_proj(merged)
+        return F.silu(token).unsqueeze(1)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1365,6 +1514,7 @@ class PCVRHyFormer(nn.Module):
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
         multi_scale_queries: bool = False,
+        user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         # query 侧可单独加大 dropout，降低对短期时间模式的依赖。
         q_dropout_mult: float = 1.0,
     ) -> None:
@@ -1438,10 +1588,10 @@ class PCVRHyFormer(nn.Module):
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
-                nn.BatchNorm1d(user_dense_dim),
-                nn.Linear(user_dense_dim, d_model),
-                nn.LayerNorm(d_model),
+            self.user_dense_proj = UserDenseFusionTokenizer(
+                dense_specs=user_dense_feature_specs or [],
+                d_model=d_model,
+                fallback_input_dim=user_dense_dim,
             )
 
         # Item dense feature projection (if available)
@@ -1849,7 +1999,7 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1897,7 +2047,7 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:

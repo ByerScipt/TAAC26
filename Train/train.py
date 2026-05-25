@@ -38,6 +38,14 @@ def build_feature_specs(
     return specs
 
 
+def build_shared_fid_tuple_specs(schema: FeatureSchema) -> List[Tuple[int, int, int]]:
+    """Build shared dense fid specs as ``(fid, offset, length)`` tuples."""
+    specs: List[Tuple[int, int, int]] = []
+    for fid, offset, length in schema.entries:
+        specs.append((fid, offset, length))
+    return specs
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
@@ -323,6 +331,8 @@ def main() -> None:
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
+    user_dense_feature_specs = build_shared_fid_tuple_specs(
+        pcvr_dataset.user_dense_schema)
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
@@ -355,6 +365,7 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "multi_scale_queries": args.multi_scale_queries,
+        "user_dense_feature_specs": user_dense_feature_specs,
         "q_dropout_mult": args.q_dropout_mult,
     }
 
