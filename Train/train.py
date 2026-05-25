@@ -193,6 +193,11 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--use_seq_calendar_features', action='store_true', default=True,
+                        help='Enable event-level calendar embeddings for sequence timestamps')
+    parser.add_argument('--no_seq_calendar_features', dest='use_seq_calendar_features',
+                        action='store_false',
+                        help='Disable event-level sequence calendar embeddings')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -302,10 +307,11 @@ def main() -> None:
     set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
-    logging.info("Experiment: exp_004_recency_length_dense_features")
+    logging.info("Experiment: exp_006_seq_calendar_time_no_month")
     logging.info(f"use_engineered_dense_features={args.use_engineered_dense_features}")
     logging.info(f"engineered_dense_dim={ENGINEERED_DENSE_DIM}")
     logging.info(f"engineered feature names={ENGINEERED_DENSE_FEATURE_NAMES}")
+    logging.info(f"use_seq_calendar_features={args.use_seq_calendar_features}")
     logging.info(f"amp_dtype={args.amp_dtype}")
     logging.info(f"use_shared_fid_tuple_token={args.use_shared_fid_tuple_token}")
     logging.info(f"shared_fids={args.shared_fids}")
@@ -407,6 +413,7 @@ def main() -> None:
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "use_seq_calendar_features": args.use_seq_calendar_features,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,

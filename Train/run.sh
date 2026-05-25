@@ -17,6 +17,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --log_every_n_steps 200 \
     --patience 3 \
     --amp_dtype bf16 \
+    --use_seq_calendar_features \
     --use_engineered_dense_features \
     --use_shared_fid_tuple_token \
     --shared_fids 62,63,64,65,66 \

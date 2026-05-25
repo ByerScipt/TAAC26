@@ -1,4 +1,4 @@
-"""PCVRHyFormer: A hybrid transformer model for post-click conversion rate prediction."""
+"""PCVRHyFormer 模型，用于预测点击后的转化概率。"""
 
 import logging
 import math
@@ -13,24 +13,28 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
-    seq_data: dict        # {domain: tensor [B, S, L]}
-    seq_lens: dict        # {domain: tensor [B]}
-    seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_data: dict        # {domain: tensor [B, S, L]}，S 是该序列域的 side-info 数
+    seq_lens: dict        # {domain: tensor [B]}，每个样本的有效序列长度
+    seq_time_buckets: dict  # {domain: tensor [B, L]}，每个事件的时间差 bucket
+    seq_calendar_feats: Optional[dict] = None  # {domain: tensor [B, 3, L]} event calendar ids
     engineered_dense_feats: Optional[torch.Tensor] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Rotary Position Embedding (RoPE)
+# 旋转位置编码（RoPE）
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 class RotaryEmbedding(nn.Module):
-    """Precomputes and caches RoPE cos/sin values.
+    """预计算并缓存 RoPE 使用的 cos/sin 表。
 
-    Attributes:
-        dim: Rotary embedding dimension.
-        max_seq_len: Maximum sequence length for cache.
-        base: Base frequency for rotary encoding.
+    RoPE 在注意力中把位置信息注入 Q/K。这里提前构建最长序列需要的缓存，forward
+    时只切片取用，减少运行时开销。
+
+    属性：
+        dim: RoPE 作用的维度，通常等于 head_dim。
+        max_seq_len: 缓存支持的最大序列长度。
+        base: 旋转位置编码的频率基数。
     """
 
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
@@ -39,11 +43,11 @@ class RotaryEmbedding(nn.Module):
         self.max_seq_len = max_seq_len
         self.base = base
 
-        # Precompute inv_freq: (dim // 2,)
+        # 预计算频率倒数，形状为 (dim // 2,)。
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
-        # Precompute cache
+        # 构建 cos/sin 缓存。
         self._build_cache(max_seq_len)
 
     def _build_cache(self, seq_len: int) -> None:
@@ -54,11 +58,10 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer('sin_cached', emb.sin().unsqueeze(0), persistent=False)  # (1, seq_len, dim)
 
     def forward(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes cos/sin values for the given sequence length.
+        """返回指定序列长度需要的 cos/sin。
 
-        Returns pre-computed slices from the cache. The cache is built once
-        in __init__ with max_seq_len; no runtime expansion is performed so
-        that the forward pass remains compatible with torch.compile().
+        缓存在 ``__init__`` 中按 ``max_seq_len`` 一次性创建。forward 阶段只做切片和
+        device 对齐，保持计算图简单。
         """
         cos = self.cos_cached[:, :seq_len, :].to(device)
         sin = self.sin_cached[:, :seq_len, :].to(device)
@@ -66,7 +69,7 @@ class RotaryEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Swaps and negates the first and second halves of the last dimension."""
+    """把最后一维前后两半交换，并对后一半取负，这是 RoPE 的旋转操作。"""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat([-x2, x1], dim=-1)
@@ -77,15 +80,16 @@ def apply_rope_to_tensor(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Applies Rotary Position Embedding to a single tensor.
+    """把 RoPE 应用到一个 Q 或 K 张量上。
 
-    Args:
-        x: (B, num_heads, L, head_dim)
-        cos: (1, L_max, head_dim) or (B, L, head_dim) for batch-specific positions.
-        sin: Same shape as cos.
+    参数：
+        x: 形状 ``(B, num_heads, L, head_dim)``。
+        cos: 形状 ``(1, L_max, head_dim)``；当每个样本位置不同，也可以是
+            ``(B, L, head_dim)``。
+        sin: 和 ``cos`` 同形状。
 
-    Returns:
-        Rotated tensor of shape (B, num_heads, L, head_dim).
+    返回：
+        旋转后的张量，形状仍为 ``(B, num_heads, L, head_dim)``。
     """
     L = x.shape[2]
     cos_ = cos[:, :L, :].unsqueeze(1)  # (*, 1, L, head_dim)
@@ -94,12 +98,12 @@ def apply_rope_to_tensor(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HyFormer Basic Components
+# HyFormer 基础组件
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU activation: x1 * SiLU(x2)."""
+    """SwiGLU 前馈层，核心激活为 ``x1 * SiLU(x2)``。"""
 
     def __init__(self, d_model: int, hidden_mult: int = 4) -> None:
         super().__init__()
@@ -116,11 +120,10 @@ class SwiGLU(nn.Module):
 
 
 class RoPEMultiheadAttention(nn.Module):
-    """Multi-head attention with Rotary Position Embedding support.
+    """支持 RoPE 的多头注意力。
 
-    Manually projects Q/K/V and reshapes for multi-head, then injects RoPE
-    after projection and before dot-product. Uses F.scaled_dot_product_attention
-    for efficient computation.
+    这里手动完成 Q/K/V 线性投影和多头 reshape，在点积注意力前把 RoPE 加到 Q/K
+    上。实际注意力计算使用 PyTorch 的 ``scaled_dot_product_attention``。
     """
 
     def __init__(
@@ -161,60 +164,60 @@ class RoPEMultiheadAttention(nn.Module):
         q_rope_sin: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> tuple:
-        """Computes multi-head attention with optional RoPE.
+        """计算多头注意力，并按需加入 RoPE。
 
-        Args:
-            query: (B, Lq, D)
-            key: (B, Lk, D)
-            value: (B, Lk, D)
-            key_padding_mask: (B, Lk), True indicates padding positions.
-            attn_mask: (Lq, Lk) or (B*num_heads, Lq, Lk), additive mask.
-            rope_cos: (1, L, head_dim), RoPE for KV side (also used for Q
-                unless q_rope_* is provided).
-            rope_sin: Same shape as rope_cos.
-            q_rope_cos: (B, Lq, head_dim) or (1, Lq, head_dim), Q-specific
-                RoPE for cross-attention with gathered positions.
-            q_rope_sin: Same shape as q_rope_cos.
-            need_weights: Compatibility parameter, not used.
+        参数：
+            query: ``(B, Lq, D)``。
+            key: ``(B, Lk, D)``。
+            value: ``(B, Lk, D)``。
+            key_padding_mask: ``(B, Lk)``，True 表示 padding 位置。
+            attn_mask: ``(Lq, Lk)`` 或 ``(B*num_heads, Lq, Lk)``，additive mask。
+            rope_cos: ``(1, L, head_dim)``，KV 侧 RoPE；未传入 q_rope_* 时也用于 Q。
+            rope_sin: 和 ``rope_cos`` 同形状。
+            q_rope_cos: ``(B, Lq, head_dim)`` 或 ``(1, Lq, head_dim)``，Q 侧专用
+                RoPE，常用于 cross-attention 中按原始位置 gather 出来的 query。
+            q_rope_sin: 和 ``q_rope_cos`` 同形状。
+            need_weights: 兼容旧接口的参数，当前不使用。
 
-        Returns:
-            Tuple of (output, None).
+        返回：
+            ``(output, None)``。
         """
         B, Lq, _ = query.shape
         Lk = key.shape[1]
 
-        # 1. Linear projection
+        # 1. 线性投影到 Q/K/V。
         Q = self.W_q(query)  # (B, Lq, D)
         K = self.W_k(key)    # (B, Lk, D)
         V = self.W_v(value)  # (B, Lk, D)
 
-        # 2. Reshape to (B, num_heads, L, head_dim)
+        # 2. 拆成多头格式：(B, num_heads, L, head_dim)。
         Q = Q.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 3. Apply RoPE independently to Q and K
+        # 3. 分别给 Q 和 K 注入 RoPE。
         if rope_cos is not None and rope_sin is not None:
-            # K always uses rope_cos/rope_sin (KV-side positional encoding)
+            # K 使用 KV 侧的位置编码。
             K = apply_rope_to_tensor(K, rope_cos, rope_sin)
 
             if self.rope_on_q:
-                # Q side: prefer dedicated q_rope_cos/sin (top_k positions in LongerEncoder cross-attn)
+                # Q 侧优先使用专门传入的位置编码，例如 LongerEncoder cross-attn 中
+                # top_k token 对应的原始位置。
                 q_cos = q_rope_cos if q_rope_cos is not None else rope_cos
                 q_sin = q_rope_sin if q_rope_sin is not None else rope_sin
                 Q = apply_rope_to_tensor(Q, q_cos, q_sin)
 
-        # 4. Convert key_padding_mask to SDPA format
+        # 4. 将 padding mask 转成 SDPA 接受的 bool mask。
         sdpa_attn_mask = None
         if key_padding_mask is not None:
-            # key_padding_mask: (B, Lk), True = padding
-            # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
+            # key_padding_mask: (B, Lk)，True 表示 padding。
+            # SDPA mask 中 True 表示允许 attend，所以这里需要取反。
             sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
             sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
 
         if attn_mask is not None:
-            # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
-            # Convert to bool: positions that are not -inf are True
+            # attn_mask 是 additive float mask，0 表示可见，-inf 表示不可见。
+            # 转成 bool mask 后与 padding mask 合并。
             bool_attn = (attn_mask == 0)  # (Lq, Lk)
             bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
             if sdpa_attn_mask is not None:
@@ -222,7 +225,7 @@ class RoPEMultiheadAttention(nn.Module):
             else:
                 sdpa_attn_mask = bool_attn
 
-        # 5. Scaled Dot-Product Attention
+        # 5. 执行 scaled dot-product attention。
         dropout_p = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(
             Q, K, V,
@@ -230,10 +233,10 @@ class RoPEMultiheadAttention(nn.Module):
             dropout_p=dropout_p,
         )  # (B, num_heads, Lq, head_dim)
 
-        # Replace NaN from all-padding softmax with 0 (zero vectors preserve original input via residual)
+        # 全 padding softmax 会产生 NaN。这里置零，残差连接会保留原始输入路径。
         out = torch.nan_to_num(out, nan=0.0)
 
-        # 6. Reshape back and output projection
+        # 6. 合并多头并做输出投影。
         out = out.transpose(1, 2).contiguous().view(B, Lq, self.d_model)
         G = self.W_g(query)
         out = out * torch.sigmoid(G)
@@ -243,10 +246,10 @@ class RoPEMultiheadAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    """Cross-attention module.
+    """Q token 到序列 token 的 cross-attention。
 
-    Query comes from global tokens (Q tokens), Key/Value comes from sequence
-    tokens. Only applies RoPE to KV side (rope_on_q=False).
+    Query 来自全局 Q token，Key/Value 来自某一路序列 token。这里设置
+    ``rope_on_q=False``，只给序列侧 K 注入位置编码。
     """
 
     def __init__(
@@ -278,17 +281,17 @@ class CrossAttention(nn.Module):
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Computes cross-attention between query tokens and sequence tokens.
+        """计算 Q token 对序列 token 的 cross-attention。
 
-        Args:
-            query: (B, Nq, D), query tokens.
-            key_value: (B, L, D), sequence tokens.
-            key_padding_mask: (B, L), True indicates padding positions.
-            rope_cos: (1, L, head_dim), KV-side RoPE cosine values.
-            rope_sin: (1, L, head_dim), KV-side RoPE sine values.
+        参数：
+            query: ``(B, Nq, D)``，当前序列域对应的 query token。
+            key_value: ``(B, L, D)``，该序列域的 event token。
+            key_padding_mask: ``(B, L)``，True 表示 padding 位置。
+            rope_cos: ``(1, L, head_dim)``，KV 侧 RoPE cos。
+            rope_sin: ``(1, L, head_dim)``，KV 侧 RoPE sin。
 
-        Returns:
-            Output tensor of shape (B, Nq, D).
+        返回：
+            更新后的 query token，形状 ``(B, Nq, D)``。
         """
         residual = query
 
@@ -314,20 +317,19 @@ class CrossAttention(nn.Module):
 
 
 class RankMixerBlock(nn.Module):
-    """HyFormer Query Boosting block.
+    """HyFormer 的 Query Boosting 模块。
 
-    Performs three steps:
-    1. Token Mixing: Parameter-free tensor reshaping.
-    2. Per-token FFN: Shared-parameter feedforward network.
-    3. Residual connection: Q_boost = Q + Q_e.
+    输入是所有序列的 decoded Q token 加上 NS token，形状为 ``(B, T, D)``。
+    full 模式下会先通过无参数 reshape/transpose 做 token mixing，再经过共享 FFN，
+    最后和原输入做残差连接。
 
-    Constraint: d_model must be divisible by n_total in 'full' mode.
+    约束：``full`` 模式要求 ``d_model`` 能被 ``T`` 整除。
     """
 
     def __init__(
         self,
         d_model: int,
-        n_total: int,  # T = Nq + Nns
+        n_total: int,  # T = Nq*S + Nns
         hidden_mult: int = 4,
         dropout: float = 0.0,
         mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
@@ -338,7 +340,7 @@ class RankMixerBlock(nn.Module):
         self.mode = mode
 
         if mode == 'none':
-            # Pure identity mapping, no submodules created
+            # 纯恒等映射，不创建子模块。
             return
 
         if mode == 'full':
@@ -348,27 +350,27 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
+        # 每个 token 共享同一套 FFN，full 和 ffn_only 模式都会使用。
         self.norm = nn.LayerNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
         self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
         self.dropout = nn.Dropout(dropout)
-        # Post-LN after residual to stabilize stacked block outputs
+        # 残差后加 LayerNorm，稳定多层 block 堆叠。
         self.post_norm = nn.LayerNorm(d_model)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
-        """Performs parameter-free token mixing via reshape and transpose.
+        """通过 reshape 和 transpose 做无参数 token mixing。
 
-        Steps:
-        1. Splits channels into T subspaces: (B, T, D) -> (B, T, T, d_sub).
-        2. Swaps token and subspace axes: (B, token, h, d_sub) -> (B, h, token, d_sub).
-        3. Flattens back: (B, T, D).
+        步骤：
+        1. 把通道切成 T 个子空间：``(B, T, D) -> (B, T, T, d_sub)``。
+        2. 交换 token 轴和子空间轴：``(B, token, h, d_sub) -> (B, h, token, d_sub)``。
+        3. 展平回 ``(B, T, D)``。
 
-        Args:
-            Q: (B, T, D)
+        参数：
+            Q: ``(B, T, D)``。
 
-        Returns:
-            Mixed tensor of shape (B, T, D).
+        返回：
+            mixing 后的 ``(B, T, D)``。
         """
         B, T, D = Q.shape
 
@@ -383,43 +385,44 @@ class RankMixerBlock(nn.Module):
         return Q_hat
 
     def forward(self, Q: torch.Tensor) -> torch.Tensor:
-        """Applies query boosting: token mixing, FFN, and residual connection.
+        """执行 Query Boosting。
 
-        Args:
-            Q: (B, T, D) where T = Nq + Nns.
+        参数：
+            Q: ``(B, T, D)``，其中 ``T = Nq*S + Nns``。
 
-        Returns:
-            Boosted tensor of shape (B, T, D).
+        返回：
+            增强后的 token，形状 ``(B, T, D)``。
         """
         if self.mode == 'none':
             return Q
 
-        # Token Mixing (parameter-free rewire) or identity
+        # full 模式做无参数 token mixing，ffn_only 模式直接进入 FFN。
         if self.mode == 'full':
             Q_hat = self.token_mixing(Q)
         else:  # 'ffn_only'
             Q_hat = Q
 
-        # Per-token FFN
+        # 对每个 token 应用共享 FFN。
         x = self.norm(Q_hat)
         x = self.fc1(x)
         x = F.gelu(x)
         x = self.dropout(x)
         Q_e = self.fc2(x)
 
-        # Residual from original Q
+        # 和原始 Q 做残差连接。
         Q_boost = Q + Q_e
         Q_boost = self.post_norm(Q_boost)
         return Q_boost
 
 
 class MultiSeqQueryGenerator(nn.Module):
-    """Multi-sequence query generation module.
+    """多序列 query token 生成模块。
 
-    Generates Q tokens independently for each sequence:
-    For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+    每个序列域独立生成自己的 Q token。对第 i 个序列域：
+        GlobalInfo_i = Concat(所有 NS token 展平, MeanPool(Seq_i))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
+
+    这样每一路序列都有专属 query，但 query 的生成会看到共享的 user/item NS 信息。
     """
 
     def __init__(
@@ -437,10 +440,10 @@ class MultiSeqQueryGenerator(nn.Module):
 
         global_info_dim = (num_ns + 1) * d_model
 
-        # LayerNorm on global_info to prevent gradient explosion from large-dim concat
+        # 对拼接后的 global_info 做 LayerNorm，稳定大维度拼接后的数值尺度。
         self.global_info_norm = nn.LayerNorm(global_info_dim)
 
-        # Each sequence has N independent FFNs
+        # 每个序列域拥有 N 个独立 FFN，分别生成 N 个 query token。
         self.query_ffns_per_seq = nn.ModuleList([
             nn.ModuleList([
                 nn.Sequential(
@@ -460,34 +463,34 @@ class MultiSeqQueryGenerator(nn.Module):
         seq_tokens_list: list,
         seq_padding_masks: list
     ) -> list:
-        """Generates query tokens for each sequence.
+        """为每个序列域生成 query token。
 
-        Args:
-            ns_tokens: (B, M, D), shared NS tokens.
-            seq_tokens_list: List of (B, L_i, D) tensors, length S.
-            seq_padding_masks: List of (B, L_i) masks, length S. True
-                indicates padding.
+        参数：
+            ns_tokens: ``(B, M, D)``，共享 NS token。
+            seq_tokens_list: 长度为 S 的列表，每项形状 ``(B, L_i, D)``。
+            seq_padding_masks: 长度为 S 的列表，每项形状 ``(B, L_i)``，True 表示
+                padding。
 
-        Returns:
-            List of (B, Nq, D) query token tensors, length S.
+        返回：
+            长度为 S 的 query token 列表，每项形状 ``(B, Nq, D)``。
         """
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
 
         q_tokens_list = []
         for i in range(self.num_sequences):
-            # MeanPool(Seq_i)
-            valid_mask = ~seq_padding_masks[i]  # True = valid
+            # 对当前序列域做 mask-aware mean pooling。
+            valid_mask = ~seq_padding_masks[i]  # True 表示有效位置。
             valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
             seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
             seq_pooled = seq_sum / seq_count  # (B, D)
 
-            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
+            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)。
             global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
             global_info = self.global_info_norm(global_info)
 
-            # Generate N query tokens
+            # 生成 N 个 query token。
             queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
             q_tokens = torch.stack(queries, dim=1)  # (B, Nq, D)
             q_tokens_list.append(q_tokens)
@@ -496,14 +499,15 @@ class MultiSeqQueryGenerator(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Sequence Encoders
+# 序列编码器
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 class SwiGLUEncoder(nn.Module):
-    """Efficient attention-free sequence encoder.
+    """轻量的无注意力序列编码器。
 
-    Structure: x + Dropout(SwiGLU(LN(x))).
+    结构为 ``x + Dropout(SwiGLU(LN(x)))``。它只做逐 token 的非线性变换，不在序列
+    token 之间建模注意力关系。
     """
 
     def __init__(
@@ -523,16 +527,15 @@ class SwiGLUEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
-        """Applies the SwiGLU encoder with residual connection.
+        """应用带残差的 SwiGLU 编码。
 
-        Args:
-            x: (B, L, D)
-            key_padding_mask: (B, L), True indicates padding. Not used by
-                this encoder variant.
-            **kwargs: Absorbs rope_cos/rope_sin and other unused parameters.
+        参数：
+            x: ``(B, L, D)``。
+            key_padding_mask: ``(B, L)``，True 表示 padding。该编码器不使用它。
+            **kwargs: 接收 rope_cos/rope_sin 等未使用参数，保持统一接口。
 
-        Returns:
-            Tuple of (output tensor of shape (B, L, D), key_padding_mask).
+        返回：
+            ``(output, key_padding_mask)``，其中 output 形状为 ``(B, L, D)``。
         """
         residual = x
         x = self.norm(x)
@@ -543,9 +546,9 @@ class SwiGLUEncoder(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    """High-capacity sequence encoder with self-attention and RoPE.
+    """带 self-attention 和 RoPE 的高容量序列编码器。
 
-    Structure: Standard Transformer Encoder Layer (Pre-LN).
+    结构是标准 Pre-LN Transformer Encoder Layer。
     """
 
     def __init__(
@@ -582,18 +585,18 @@ class TransformerEncoder(nn.Module):
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Applies one Transformer encoder layer.
+        """执行一层 Transformer encoder。
 
-        Args:
-            x: (B, L, D)
-            key_padding_mask: (B, L), True indicates padding positions.
-            rope_cos: (1, L, head_dim), RoPE cosine values.
-            rope_sin: (1, L, head_dim), RoPE sine values.
+        参数：
+            x: ``(B, L, D)``。
+            key_padding_mask: ``(B, L)``，True 表示 padding。
+            rope_cos: ``(1, L, head_dim)``，RoPE cos。
+            rope_sin: ``(1, L, head_dim)``，RoPE sin。
 
-        Returns:
-            Tuple of (output tensor of shape (B, L, D), key_padding_mask).
+        返回：
+            ``(output, key_padding_mask)``，其中 output 形状为 ``(B, L, D)``。
         """
-        # Self-Attention (Pre-LN) with RoPE
+        # Pre-LN self-attention，可选 RoPE。
         residual = x
         x = self.norm1(x)
         x, _ = self.self_attn(
@@ -606,7 +609,7 @@ class TransformerEncoder(nn.Module):
         )
         x = residual + x
 
-        # FFN (Pre-LN)
+        # Pre-LN FFN。
         residual = x
         x = self.norm2(x)
         x = self.ffn(x)
@@ -615,19 +618,18 @@ class TransformerEncoder(nn.Module):
         return x, key_padding_mask
 
 class LongerEncoder(nn.Module):
-    """Top-K compressed sequence encoder.
+    """Top-K 压缩序列编码器。
 
-    Adapts behavior based on input length:
-    - L > top_k (first MultiSeqHyFormerBlock): Cross Attention.
-      Q = latest top_k tokens, K/V = all seq tokens -> output (B, top_k, D).
-    - L <= top_k (subsequent MultiSeqHyFormerBlocks): Self Attention.
-      Q = K = V = top_k tokens -> output (B, top_k, D).
+    根据输入长度选择行为：
+    - ``L > top_k`` 时，取最近的 top_k 个有效 token 作为 Q，完整序列作为 K/V，
+      通过 cross-attention 压缩成 ``(B, top_k, D)``。
+    - ``L <= top_k`` 时，在当前 token 上做 self-attention，输出仍为
+      ``(B, top_k, D)`` 或当前长度对应形状。
 
-    Causal mask is only applied among top_k tokens (self-attention layers);
-    the first cross-attention layer does not use a causal mask since Q and K
-    have different lengths.
+    causal mask 只作用在 top_k token 的 self-attention 阶段。第一层 cross-attention
+    中 Q 和 K 长度不同，直接让最近 top_k token attend 完整历史。
 
-    Returns (output, new_key_padding_mask) so downstream can update the mask.
+    返回 ``(output, new_key_padding_mask)``，下游 block 会继续使用更新后的 mask。
     """
 
     def __init__(
@@ -643,11 +645,11 @@ class LongerEncoder(nn.Module):
         self.top_k = top_k
         self.causal = causal
 
-        # Pre-LN for attention
+        # attention 前的 LayerNorm。
         self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
 
-        # Shared RoPEMHA for both cross and self attention
+        # cross-attention 和 self-attention 共用这套 RoPE MHA。
         self.attn = RoPEMultiheadAttention(
             d_model=d_model,
             num_heads=num_heads,
@@ -655,7 +657,7 @@ class LongerEncoder(nn.Module):
             rope_on_q=True,
         )
 
-        # FFN (Pre-LN + residual)
+        # Pre-LN FFN 加残差。
         self.ffn_norm = nn.LayerNorm(d_model)
         hidden_dim = d_model * hidden_mult
         self.ffn = nn.Sequential(
@@ -671,50 +673,50 @@ class LongerEncoder(nn.Module):
         x: torch.Tensor,
         key_padding_mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Selects the latest top_k valid tokens from each sample.
+        """为每个样本选出最近的 top_k 个有效 token。
 
-        Args:
-            x: (B, L, D)
-            key_padding_mask: (B, L), True indicates padding.
+        参数：
+            x: ``(B, L, D)``。
+            key_padding_mask: ``(B, L)``，True 表示 padding。
 
-        Returns:
-            top_k_tokens: (B, top_k, D)
-            new_padding_mask: (B, top_k), True indicates padding.
-            position_indices: (B, top_k), original position index for each
-                selected token, used for Q-side RoPE.
+        返回：
+            top_k_tokens: ``(B, top_k, D)``。
+            new_padding_mask: ``(B, top_k)``，True 表示 padding。
+            position_indices: ``(B, top_k)``，所选 token 在原序列中的位置，用于
+                Q 侧 RoPE。
         """
         B, L, D = x.shape
         device = x.device
 
-        # Valid lengths per sample
+        # 每个样本的有效长度。
         valid_len = (~key_padding_mask).sum(dim=1)  # (B,)
 
-        # Start position for each sample: max(valid_len - top_k, 0)
+        # 每个样本的起始位置：max(valid_len - top_k, 0)。
         actual_k = torch.clamp(valid_len, max=self.top_k)  # (B,)
         start_pos = valid_len - actual_k  # (B,)
 
-        # Build gather indices: (B, top_k)
+        # 构造 gather 索引，形状 (B, top_k)。
         offsets = torch.arange(self.top_k, device=device).unsqueeze(0).expand(B, -1)  # (B, top_k)
         indices = start_pos.unsqueeze(1) + offsets  # (B, top_k)
 
-        # For samples with valid_len < top_k, early indices may exceed valid range;
-        # clamp to [0, L-1] and handle via mask below
+        # 有效长度小于 top_k 时，前部位置由 mask 标成 padding。索引本身先裁剪到
+        # [0, L-1]，保证 gather 合法。
         indices = torch.clamp(indices, min=0, max=L - 1)
 
-        # Gather: (B, top_k, D)
+        # gather 得到 (B, top_k, D)。
         indices_expanded = indices.unsqueeze(-1).expand(-1, -1, D)  # (B, top_k, D)
         top_k_tokens = torch.gather(x, dim=1, index=indices_expanded)
 
-        # New padding mask: first (top_k - actual_k) positions are padding
+        # 新 mask 中，前 (top_k - actual_k) 个位置是 padding。
         new_valid_len = actual_k  # (B,)
         pad_count = self.top_k - new_valid_len  # (B,)
         pos_indices = torch.arange(self.top_k, device=device).unsqueeze(0)  # (1, top_k)
         new_padding_mask = pos_indices < pad_count.unsqueeze(1)  # (B, top_k)
 
-        # Zero out tokens at padding positions
+        # padding 位置清零。
         top_k_tokens = top_k_tokens * (~new_padding_mask).unsqueeze(-1).float()
 
-        # position_indices for Q-side RoPE
+        # Q 侧 RoPE 使用这些原始位置索引。
         position_indices = indices  # (B, top_k)
 
         return top_k_tokens, new_padding_mask, position_indices
@@ -726,63 +728,62 @@ class LongerEncoder(nn.Module):
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Applies the LongerEncoder with adaptive cross/self attention.
+        """执行 LongerEncoder 的自适应 cross/self attention。
 
-        Args:
-            x: (B, L, D), sequence tokens.
-            key_padding_mask: (B, L), True indicates padding.
-            rope_cos: (1, L, head_dim), RoPE cosine values (length must cover
-                original sequence length L).
-            rope_sin: (1, L, head_dim), RoPE sine values.
+        参数：
+            x: ``(B, L, D)``，序列 token。
+            key_padding_mask: ``(B, L)``，True 表示 padding。
+            rope_cos: ``(1, L, head_dim)``，长度覆盖原始序列长度 L。
+            rope_sin: ``(1, L, head_dim)``。
 
-        Returns:
-            output: (B, top_k, D), compressed sequence.
-            new_key_padding_mask: (B, top_k), updated padding mask.
+        返回：
+            output: ``(B, top_k, D)``，压缩后的序列。
+            new_key_padding_mask: ``(B, top_k)``，更新后的 padding mask。
         """
         B, L, D = x.shape
 
         if L > self.top_k:
-            # === Cross Attention mode (first MultiSeqHyFormerBlock) ===
-            # 1. Extract latest top_k tokens as query
+            # === Cross Attention 模式，通常出现在第一个 MultiSeqHyFormerBlock ===
+            # 1. 取最近 top_k token 作为 query。
             q, new_mask, q_pos_indices = self._gather_top_k(x, key_padding_mask)
 
-            # 2. Pre-LN
+            # 2. attention 前归一化。
             q_normed = self.norm_q(q)
             kv_normed = self.norm_kv(x)
 
-            # 3. Build Q-side RoPE cos/sin by gathering from global cos/sin at top_k positions
+            # 3. 从全局 RoPE 表中按 top_k 原始位置取出 Q 侧 cos/sin。
             q_rope_cos = None
             q_rope_sin = None
             if rope_cos is not None and rope_sin is not None:
-                # rope_cos: (1, L_max, head_dim), q_pos_indices: (B, top_k)
+                # rope_cos: (1, L_max, head_dim)，q_pos_indices: (B, top_k)。
                 head_dim = rope_cos.shape[2]
-                # Expand to batch dimension
+                # 扩展到 batch 维，便于按样本 gather。
                 cos_expanded = rope_cos.expand(B, -1, -1)  # (B, L_max, head_dim)
                 sin_expanded = rope_sin.expand(B, -1, -1)
                 idx = q_pos_indices.unsqueeze(-1).expand(-1, -1, head_dim)  # (B, top_k, head_dim)
                 q_rope_cos = torch.gather(cos_expanded, 1, idx)  # (B, top_k, head_dim)
                 q_rope_sin = torch.gather(sin_expanded, 1, idx)
 
-            # 4. Cross Attention (no causal mask since Q and K have different lengths)
+            # 4. cross-attention。Q 和 K 长度不同，此处不使用 causal mask。
             attn_out, _ = self.attn(
                 query=q_normed,
                 key=kv_normed,
                 value=kv_normed,
-                key_padding_mask=key_padding_mask,  # Original (B, L) mask
+                key_padding_mask=key_padding_mask,  # 原始 (B, L) mask。
                 rope_cos=rope_cos,
                 rope_sin=rope_sin,
                 q_rope_cos=q_rope_cos,
                 q_rope_sin=q_rope_sin,
             )
-            out = q + attn_out  # Residual based on q
+            out = q + attn_out  # 基于 q 的残差。
         else:
-            # === Self Attention mode (subsequent MultiSeqHyFormerBlocks) ===
+            # === Self Attention 模式，用于后续已经压缩过的序列 ===
             new_mask = key_padding_mask
 
-            # Pre-LN (Q and KV share norm_q)
+            # Pre-LN，Q/K/V 共用 norm_q。
             x_normed = self.norm_q(x)
 
-            # Causal mask
+            # 可选 causal mask。
             attn_mask = None
             if self.causal:
                 attn_mask = nn.Transformer.generate_square_subsequent_mask(
@@ -800,7 +801,7 @@ class LongerEncoder(nn.Module):
             )
             out = x + attn_out
 
-        # FFN (Pre-LN + residual)
+        # Pre-LN FFN 加残差。
         residual = out
         out = self.ffn_norm(out)
         out = self.ffn(out)
@@ -818,20 +819,19 @@ def create_sequence_encoder(
     top_k: int = 50,
     causal: bool = False
 ) -> nn.Module:
-    """Creates a sequence encoder of the specified type.
+    """按配置创建序列编码器。
 
-    Args:
-        encoder_type: One of 'swiglu', 'transformer', or 'longer'.
-        d_model: Model dimension.
-        num_heads: Number of attention heads (used by transformer/longer).
-        hidden_mult: FFN expansion multiplier.
-        dropout: Dropout rate.
-        top_k: Compression length for LongerEncoder (only used by longer).
-        causal: Whether to use causal mask in LongerEncoder (only used by
-            longer).
+    参数：
+        encoder_type: ``'swiglu'``、``'transformer'`` 或 ``'longer'``。
+        d_model: 模型隐藏维度。
+        num_heads: 注意力头数，transformer/longer 使用。
+        hidden_mult: FFN 扩展倍数。
+        dropout: dropout 比例。
+        top_k: LongerEncoder 的压缩长度。
+        causal: LongerEncoder 是否启用 causal mask。
 
-    Returns:
-        A sequence encoder module.
+    返回：
+        序列编码器模块。
     """
     if encoder_type == 'swiglu':
         return SwiGLUEncoder(d_model, hidden_mult, dropout)
@@ -844,16 +844,15 @@ def create_sequence_encoder(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HyFormer Blocks
+# HyFormer Block
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 class MultiSeqHyFormerBlock(nn.Module):
-    """Multi-sequence HyFormer block.
+    """多序列 HyFormer block。
 
-    Each of the S sequences independently performs Sequence Evolution and
-    Query Decoding, then all Q tokens and shared NS tokens are merged for
-    joint Query Boosting.
+    每一路序列先独立完成 Sequence Evolution 和 Query Decoding。随后把所有序列域的
+    Q token 与共享 NS token 拼在一起，通过 RankMixer 做联合 Query Boosting。
     """
 
     def __init__(
@@ -875,7 +874,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         self.num_queries = num_queries
         self.num_ns = num_ns
 
-        # Independent sequence encoder per sequence
+        # 每个序列域一套独立 sequence encoder。
         self.seq_encoders = nn.ModuleList([
             create_sequence_encoder(
                 encoder_type=seq_encoder_type,
@@ -889,7 +888,7 @@ class MultiSeqHyFormerBlock(nn.Module):
             for _ in range(num_sequences)
         ])
 
-        # Independent cross-attention per sequence
+        # 每个序列域一套独立 cross-attention。
         self.cross_attns = nn.ModuleList([
             CrossAttention(
                 d_model=d_model,
@@ -900,7 +899,7 @@ class MultiSeqHyFormerBlock(nn.Module):
             for _ in range(num_sequences)
         ])
 
-        # RankMixer: input token count = Nq * S + Nns
+        # RankMixer 的输入 token 数：Nq * S + Nns。
         n_total = num_queries * num_sequences + num_ns
         self.mixer = RankMixerBlock(
             d_model=d_model,
@@ -919,27 +918,25 @@ class MultiSeqHyFormerBlock(nn.Module):
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[list, torch.Tensor, list, list]:
-        """Processes one multi-sequence HyFormer block step.
+        """执行一个 MultiSeqHyFormerBlock。
 
-        Args:
-            q_tokens_list: List of (B, Nq, D) tensors, length S.
-            ns_tokens: (B, Nns, D)
-            seq_tokens_list: List of (B, L_i, D) tensors, length S.
-            seq_padding_masks: List of (B, L_i) masks, length S.
-            rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
-            rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+        参数：
+            q_tokens_list: 长度为 S 的列表，每项 ``(B, Nq, D)``。
+            ns_tokens: ``(B, Nns, D)``。
+            seq_tokens_list: 长度为 S 的列表，每项 ``(B, L_i, D)``。
+            seq_padding_masks: 长度为 S 的列表，每项 ``(B, L_i)``。
+            rope_cos_list: 长度为 S 的 RoPE cos 列表。
+            rope_sin_list: 长度为 S 的 RoPE sin 列表。
 
-        Returns:
-            A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
-            next_q_list is a list of (B, Nq, D) updated query tensors,
-            next_ns is (B, Nns, D) updated non-sequence tokens,
-            next_seq_list is a list of (B, L_i', D) encoded sequence tensors,
-            and next_masks is a list of (B, L_i') updated padding masks.
+        返回：
+            ``(next_q_list, next_ns, next_seq_list, next_masks)``。其中
+            next_q_list 是更新后的各序列 query，next_ns 是更新后的 NS token，
+            next_seq_list 是编码后的各序列 token，next_masks 是对应 padding mask。
         """
         S = self.num_sequences
         Nq = self.num_queries
 
-        # 1. Independent Sequence Evolution per sequence
+        # 1. 各序列域独立做 Sequence Evolution。
         next_seqs = []
         next_masks = []
         for i in range(S):
@@ -953,7 +950,7 @@ class MultiSeqHyFormerBlock(nn.Module):
             next_seqs.append(next_seq_i)
             next_masks.append(mask_i)
 
-        # 2. Independent Query Decoding per sequence
+        # 2. 各序列域独立做 Query Decoding：Q attend 自己对应的序列。
         decoded_qs = []
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
@@ -964,13 +961,13 @@ class MultiSeqHyFormerBlock(nn.Module):
             )
             decoded_qs.append(decoded_q_i)
 
-        # 3. Token Fusion: concatenate all decoded_q + ns_tokens
+        # 3. Token Fusion：拼接所有 decoded Q 和 NS token。
         combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, Nq*S + Nns, D)
 
-        # 4. Query Boosting
+        # 4. Query Boosting：RankMixer 在 Q/NS token 之间做交叉。
         boosted = self.mixer(combined)  # (B, Nq*S + Nns, D)
 
-        # 5. Split back into per-sequence Q and NS
+        # 5. 切回各序列域 Q token 和共享 NS token。
         next_q_list = []
         offset = 0
         for i in range(S):
@@ -982,7 +979,7 @@ class MultiSeqHyFormerBlock(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PCVRHyFormer Main Model
+# PCVRHyFormer 主模型
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -997,11 +994,10 @@ def _filter_feature_groups(
 
 
 class GroupNSTokenizer(nn.Module):
-    """NS tokenizer used by ns_tokenizer_type='group'.
+    """``ns_tokenizer_type='group'`` 时使用的 NS tokenizer。
 
-    Groups discrete features by fid, applies shared embedding with mean
-    pooling per multi-valued feature, then projects each group to a single
-    NS token (one token per group).
+    它先按 feature group 收集离散特征，对单值特征直接查 Embedding，对多值特征查
+    Embedding 后做 padding-aware mean pooling。每个 group 最后投影成一个 NS token。
     """
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
@@ -1015,8 +1011,7 @@ class GroupNSTokenizer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.exclude_feature_indices = set(exclude_feature_indices or [])
 
-        # One embedding table per fid (None if skipped by emb_skip_threshold
-        # or if vocab_size <= 0 / no vocab info).
+        # 每个 fid 一张 Embedding 表。被 emb_skip_threshold 跳过或缺少词表信息时记为 None。
         embs = []
         for fid_idx, (vs, offset, length) in enumerate(feature_specs):
             skip = (
@@ -1029,7 +1024,7 @@ class GroupNSTokenizer(nn.Module):
             else:
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
-        # Map from fid index to position in self.embs (or -1 if filtered)
+        # fid index 到 self.embs 实际下标的映射；-1 表示该特征被过滤。
         self._emb_index = []
         real_idx = 0
         for e in embs:
@@ -1039,7 +1034,7 @@ class GroupNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
-        # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
+        # 每个 group 一套投影：num_fids_in_group * emb_dim -> d_model。
         self.group_projs = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(max(1, len(group) * emb_dim), d_model),
@@ -1049,13 +1044,13 @@ class GroupNSTokenizer(nn.Module):
         ])
 
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
-        """Embeds and projects grouped discrete features into NS tokens.
+        """把分组离散特征编码成 NS token。
 
-        Args:
-            int_feats: (B, total_int_dim), concatenated integer features.
+        参数：
+            int_feats: ``(B, total_int_dim)``，拼接后的离散特征张量。
 
-        Returns:
-            Tokens of shape (B, num_groups, D).
+        返回：
+            ``(B, num_groups, D)``。
         """
         tokens = []
         for group, proj in zip(self.groups, self.group_projs):
@@ -1064,15 +1059,15 @@ class GroupNSTokenizer(nn.Module):
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
                 if emb_real_idx == -1:
-                    # Filtered high-cardinality feature: output zero vector
+                    # 被过滤的高基数特征使用零向量占位。
                     fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
-                        # Single-value feature: direct lookup
+                        # 单值特征直接查表。
                         fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
                     else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
+                        # 多值特征查表后对非 padding 位置做 mean pooling。
                         vals = int_feats[:, offset:offset + length].long()  # (B, length)
                         emb_all = emb_layer(vals)  # (B, length, emb_dim)
                         mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
@@ -1088,11 +1083,11 @@ class GroupNSTokenizer(nn.Module):
 
 
 class RankMixerNSTokenizer(nn.Module):
-    """NS Tokenizer following the RankMixer paper's approach.
+    """RankMixer 风格的 NS tokenizer。
 
-    All group embedding vectors are concatenated into a single long vector,
-    then equally split into num_ns_tokens segments, each projected to d_model.
-    This allows num_ns_tokens to be chosen freely (independent of group count).
+    它会按 group 顺序把所有离散特征的 Embedding 拼成一个长向量，再平均切成
+    ``num_ns_tokens`` 段，每段投影成一个 ``d_model`` 维 token。这样 NS token 数可以
+    独立调节，不再等于 group 数。
     """
 
     def __init__(
@@ -1105,15 +1100,15 @@ class RankMixerNSTokenizer(nn.Module):
         emb_skip_threshold: int = 0,
         exclude_feature_indices: Optional[List[int]] = None,
     ) -> None:
-        """Initializes RankMixerNSTokenizer.
+        """初始化 RankMixerNSTokenizer。
 
-        Args:
-            feature_specs: [(vocab_size, offset, length), ...] per feature.
-            groups: List of feature index groups (defines semantic ordering).
-            emb_dim: Embedding dimension per feature.
-            d_model: Output token dimension.
-            num_ns_tokens: Number of NS tokens to produce (T segments).
-            emb_skip_threshold: Skip embedding for features with vocab > threshold.
+        参数：
+            feature_specs: 每个特征的 ``(vocab_size, offset, length)``。
+            groups: feature index 分组，同时决定拼接顺序。
+            emb_dim: 单个特征 Embedding 维度。
+            d_model: 输出 token 维度。
+            num_ns_tokens: 需要产出的 NS token 数。
+            emb_skip_threshold: 词表大小超过该阈值的特征不创建 Embedding。
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1125,8 +1120,7 @@ class RankMixerNSTokenizer(nn.Module):
         if num_ns_tokens <= 0:
             raise ValueError(f"num_ns_tokens must be positive, got {num_ns_tokens}")
 
-        # One embedding table per fid (None if skipped by emb_skip_threshold
-        # or if vocab_size <= 0 / no vocab info).
+        # 每个 fid 一张 Embedding 表。被阈值过滤或缺少词表信息时记为 None。
         embs = []
         for fid_idx, (vs, offset, length) in enumerate(feature_specs):
             skip = (
@@ -1139,7 +1133,7 @@ class RankMixerNSTokenizer(nn.Module):
             else:
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
-        # Map from fid index to position in self.embs (or -1 if filtered)
+        # fid index 到 self.embs 实际下标的映射；-1 表示该特征被过滤。
         self._emb_index = []
         real_idx = 0
         for e in embs:
@@ -1149,18 +1143,18 @@ class RankMixerNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
-        # Compute total embedding dim: sum of all active fids across all groups
+        # 计算拼接后的总维度：所有有效 fid 数 * emb_dim。
         total_num_fids = sum(len(g) for g in self.groups)
         if total_num_fids == 0:
             raise ValueError("RankMixerNSTokenizer has no active features after exclusions")
         total_emb_dim = total_num_fids * emb_dim
 
-        # Pad total_emb_dim to be divisible by num_ns_tokens
+        # 通过尾部补零让总维度可以被 num_ns_tokens 整除。
         self.chunk_dim = math.ceil(total_emb_dim / num_ns_tokens)
         self.padded_total_dim = self.chunk_dim * num_ns_tokens
         self._pad_size = self.padded_total_dim - total_emb_dim
 
-        # Per-chunk projection: chunk_dim -> d_model with LayerNorm
+        # 每个 chunk 单独投影到 d_model，并做 LayerNorm。
         self.token_projs = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.chunk_dim, d_model),
@@ -1176,15 +1170,15 @@ class RankMixerNSTokenizer(nn.Module):
         )
 
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
-        """Embeds all features, concatenates, splits, and projects.
+        """查表、拼接、切块并投影成 NS token。
 
-        Args:
-            int_feats: (B, total_int_dim) concatenated integer features.
+        参数：
+            int_feats: ``(B, total_int_dim)``，拼接后的离散特征张量。
 
-        Returns:
-            (B, num_ns_tokens, d_model) tensor.
+        返回：
+            ``(B, num_ns_tokens, d_model)``。
         """
-        # 1. Embed all fids in group order → flat cat
+        # 1. 按 group 顺序查所有 fid 的 Embedding，然后拼成一个长向量。
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
@@ -1206,12 +1200,12 @@ class RankMixerNSTokenizer(nn.Module):
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
 
-        # 2. Pad if needed
+        # 2. 需要时在末尾补零。
         if self._pad_size > 0:
             cat_emb = F.pad(cat_emb, (0, self._pad_size))  # (B, padded_total_dim)
 
-        # 3. Split into num_ns_tokens chunks and project each
-        chunks = cat_emb.split(self.chunk_dim, dim=-1)  # list of (B, chunk_dim)
+        # 3. 切成 num_ns_tokens 个 chunk，每个 chunk 投影成一个 token。
+        chunks = cat_emb.split(self.chunk_dim, dim=-1)  # 每项形状为 (B, chunk_dim)。
         tokens = []
         for chunk, proj in zip(chunks, self.token_projs):
             tokens.append(F.silu(proj(chunk)).unsqueeze(1))  # (B, 1, d_model)
@@ -1220,7 +1214,12 @@ class RankMixerNSTokenizer(nn.Module):
 
 
 class SharedFidTupleTokenizer(nn.Module):
-    """Builds one schema-aware token from shared user int+dense fids."""
+    """把共享 fid 的 user_int 和 user_dense 对齐编码成一个 tuple token。
+
+    这个模块服务当前 best 中的 tokenization 改动：对于同一组 fid，int 部分提供离散
+    ID，dense 部分提供与该 ID 对齐的数值。逐元素结合后再聚合，避免二者分别进入
+    generic token 后丢失对齐关系。
+    """
 
     def __init__(
         self,
@@ -1347,24 +1346,29 @@ class SharedFidTupleTokenizer(nn.Module):
 
 
 class PCVRHyFormer(nn.Module):
-    """PCVRHyFormer model for post-click conversion rate prediction.
+    """PCVRHyFormer 主模型。
 
-    Combines MultiSeqHyFormerBlock and MultiSeqQueryGenerator to process
-    multiple input sequences with non-sequence features.
+    输入先被拆成三类 token：
+    - NS token：来自 user/item 离散特征、dense 特征，以及可选 tuple token。
+    - sequence token：每个 seq_a/seq_b/seq_c/seq_d 事件一枚 token。
+    - query token：由 NS token 和每路序列的 pooled summary 生成。
+
+    之后每个 HyFormer block 先让 query attend 对应序列，再把所有 query 和 NS token
+    放进 RankMixer 交叉，最后只取 query 输出做分类。
     """
 
     def __init__(
         self,
-        # Data schema
+        # 数据 schema。
         user_int_feature_specs: List[Tuple[int, int, int]],
         item_int_feature_specs: List[Tuple[int, int, int]],
         user_dense_dim: int,
         item_dense_dim: int,
         seq_vocab_sizes: "dict[str, List[int]]",  # {domain: [vocab_size_per_fid, ...]}
-        # NS grouping config (grouped by fid index)
+        # NS 分组配置，内部使用 fid index。
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
-        # Model hyperparameters
+        # 模型超参数。
         d_model: int = 64,
         emb_dim: int = 64,
         num_queries: int = 1,
@@ -1377,12 +1381,13 @@ class PCVRHyFormer(nn.Module):
         seq_causal: bool = False,
         action_num: int = 1,
         num_time_buckets: int = 65,
+        use_seq_calendar_features: bool = True,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
-        # NS tokenizer variant
+        # NS tokenizer 变体。
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
@@ -1399,9 +1404,10 @@ class PCVRHyFormer(nn.Module):
         self.emb_dim = emb_dim
         self.action_num = action_num
         self.num_queries = num_queries
-        self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
+        self.seq_domains = sorted(seq_vocab_sizes.keys())  # 固定顺序，保证训练和推理一致。
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
+        self.use_seq_calendar_features = use_seq_calendar_features
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1457,10 +1463,10 @@ class PCVRHyFormer(nn.Module):
         )
         logging.info(f"tuple token count={self.shared_fid_tuple_token_count}")
 
-        # ================== NS Tokens Construction ==================
+        # ================== NS token 构造 ==================
 
         if ns_tokenizer_type == 'group':
-            # Original: one NS token per group
+            # group 模式：每个分组产出一个 NS token。
             self.user_ns_tokenizer = GroupNSTokenizer(
                 feature_specs=user_int_feature_specs,
                 groups=user_ns_groups,
@@ -1480,8 +1486,8 @@ class PCVRHyFormer(nn.Module):
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
-            # RankMixer paper style: all embeddings cat → split → project
-            # 0 means auto: fall back to group count
+            # rankmixer 模式：所有 Embedding 先拼接，再切块投影成固定数量 token。
+            # token 数为 0 时自动回退到 group 数。
             if user_ns_tokens <= 0:
                 user_ns_tokens = len(user_ns_groups)
             if item_ns_tokens <= 0:
@@ -1513,7 +1519,7 @@ class PCVRHyFormer(nn.Module):
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
-        # User dense feature projection (if available)
+        # user dense 整体投影成一个 NS token。
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
@@ -1530,7 +1536,7 @@ class PCVRHyFormer(nn.Module):
         else:
             self.user_dense_generic_mask = None
 
-        # Item dense feature projection (if available)
+        # item dense 整体投影成一个 NS token。
         self.has_item_dense = item_dense_dim > 0
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
@@ -1538,12 +1544,12 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        # Total NS token count
+        # 统计最终 NS token 数，用于后续 query generator 和 RankMixer。
         self.num_ns = (num_user_ns + self.shared_fid_tuple_token_count
                        + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
-        # ================== Check d_model % T == 0 constraint (full mode only) ==================
+        # ================== 检查 RankMixer full 模式的维度约束 ==================
         T = num_queries * self.num_sequences + self.num_ns
         if rank_mixer_mode == 'full' and d_model % T != 0:
             valid_T_values = [t for t in range(1, d_model + 1) if d_model % t == 0]
@@ -1553,15 +1559,17 @@ class PCVRHyFormer(nn.Module):
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
 
-        # ================== Seq Tokens Embedding ==================
-        # seq_id_threshold decides which features inside the seq tokenizer are
-        # treated as id features (they receive extra dropout). It is fully
-        # independent of emb_skip_threshold (which skips Embedding creation).
+        # ================== 序列 token Embedding ==================
+        # seq_id_threshold 决定序列 tokenizer 内哪些特征按 ID 特征处理。ID 特征训练时
+        # 会使用额外 dropout。它和 emb_skip_threshold 相互独立；后者控制是否创建
+        # Embedding 表。
         self.seq_id_emb_dropout = nn.Dropout(dropout_rate * 2)
 
         def _make_seq_embs(vocab_sizes):
-            """Create embedding list, returning None for features skipped via
-            emb_skip_threshold or with no vocab info (vs<=0)."""
+            """创建序列 side-info 的 Embedding 列表。
+
+            被 emb_skip_threshold 过滤或缺少词表信息（vs<=0）的特征返回 None。
+            """
             embs_raw = []
             for vs in vocab_sizes:
                 skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
@@ -1570,7 +1578,7 @@ class PCVRHyFormer(nn.Module):
                 else:
                     embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
-            # Map from position index to real index in module_list (-1 if skipped)
+            # position index 到 module_list 实际下标的映射；-1 表示该特征被跳过。
             index_map = []
             real_idx = 0
             for e in embs_raw:
@@ -1582,11 +1590,11 @@ class PCVRHyFormer(nn.Module):
             is_id = [int(vs) > seq_id_threshold for vs in vocab_sizes]
             return module_list, index_map, is_id
 
-        # ================== Dynamic Sequence Embeddings ==================
+        # ================== 动态序列 Embedding：每个序列域一套表和投影 ==================
         self._seq_embs = nn.ModuleDict()
-        self._seq_emb_index = {}    # domain -> index_map
-        self._seq_is_id = {}        # domain -> is_id list
-        self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
+        self._seq_emb_index = {}    # domain -> index_map。
+        self._seq_is_id = {}        # domain -> is_id list。
+        self._seq_vocab_sizes = {}  # domain -> vocab_sizes list。
         self._seq_proj = nn.ModuleDict()
 
         for domain in self.seq_domains:
@@ -1601,12 +1609,20 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        # ================== Time Interval Bucket Embedding (optional) ==================
+        # ================== 时间差 bucket Embedding，可选 ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
-        # ================== HyFormer Components ==================
-        # MultiSeqQueryGenerator
+        if self.use_seq_calendar_features:
+            self.seq_calendar_embeddings = nn.ModuleDict({
+                'hour_of_day': nn.Embedding(25, d_model, padding_idx=0),
+                'day_of_week': nn.Embedding(8, d_model, padding_idx=0),
+                'day_of_month': nn.Embedding(32, d_model, padding_idx=0),
+            })
+            self.seq_calendar_alpha = nn.Parameter(torch.zeros(1))
+
+        # ================== HyFormer 组件 ==================
+        # MultiSeqQueryGenerator 根据 NS token 和序列 summary 生成每路 query token。
         self.query_generator = MultiSeqQueryGenerator(
             d_model=d_model,
             num_ns=self.num_ns,
@@ -1615,7 +1631,7 @@ class PCVRHyFormer(nn.Module):
             hidden_mult=hidden_mult,
         )
 
-        # MultiSeqHyFormerBlock stack
+        # 多层 MultiSeqHyFormerBlock 堆叠，负责 sequence evolution、query decoding 和 token mixing。
         self.blocks = nn.ModuleList([
             MultiSeqHyFormerBlock(
                 d_model=d_model,
@@ -1640,16 +1656,16 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
-        # Output projection
+        # 输出投影：拼接所有序列域的最终 Q token 后压回 d_model。
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
 
-        # Dropout
+        # Embedding/token dropout。
         self.emb_dropout = nn.Dropout(dropout_rate)
 
-        # Classifier
+        # 二分类分类头。
         self.clsfier = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
@@ -1658,7 +1674,7 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(d_model, action_num)
         )
 
-        # Initialize parameters
+        # 初始化 Embedding 参数。
         self._init_params()
 
         if self.use_engineered_dense_features:
@@ -1670,7 +1686,7 @@ class PCVRHyFormer(nn.Module):
             )
             self.engineered_alpha = nn.Parameter(torch.zeros(1))
 
-        # Log emb_skip_threshold filtering stats
+        # 记录 emb_skip_threshold 实际过滤了哪些特征。
         if emb_skip_threshold > 0:
             def _count_filtered(vocab_sizes, emb_index):
                 filtered = sum(1 for idx in emb_index if idx == -1)
@@ -1689,7 +1705,7 @@ class PCVRHyFormer(nn.Module):
                     logging.info(f"emb_skip_threshold={emb_skip_threshold}: {name} skipped {f}/{t} features")
 
     def _init_params(self) -> None:
-        """Applies Xavier initialization to all embedding weights."""
+        """对所有 Embedding 权重做 Xavier 初始化，并保持 padding 行为 0。"""
         for domain in self.seq_domains:
             for emb in self._seq_embs[domain]:
                 nn.init.xavier_normal_(emb.weight.data)
@@ -1709,19 +1725,24 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        if self.use_seq_calendar_features:
+            for emb in self.seq_calendar_embeddings.values():
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
-        """Reinitializes only high-cardinality embeddings.
+        """只重置高基数 Embedding。
 
-        Preserves low-cardinality and time feature embeddings.
+        低基数 Embedding 和时间特征 Embedding 会保留。trainer.py 会在重建 Adagrad
+        优化器时保留这些未重置参数的优化器状态。
 
-        Args:
-            cardinality_threshold: Only embeddings with vocab_size exceeding
-                this value are reinitialized.
+        参数：
+            cardinality_threshold: vocab_size 大于该值的 Embedding 会被重置。
 
-        Returns:
-            A set of data_ptr() values for reinitialized parameters.
+        返回：
+            被重置参数的 ``data_ptr()`` 集合。
         """
         reinit_count = 0
         skip_count = 0
@@ -1734,7 +1755,7 @@ class PCVRHyFormer(nn.Module):
             for i, vs in enumerate(vocab_sizes):
                 real_idx = emb_index[i]
                 if real_idx == -1:
-                    # Skipped by emb_skip_threshold, no embedding to reinit
+                    # 已被 emb_skip_threshold 跳过，没有 Embedding 需要重置。
                     continue
                 emb = emb_list[real_idx]
                 if int(vs) > cardinality_threshold:
@@ -1777,16 +1798,18 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        # time_embedding is always preserved
+        # time_embedding 始终保留。
         if self.num_time_buckets > 0:
             skip_count += 1
+        if self.use_seq_calendar_features:
+            skip_count += len(self.seq_calendar_embeddings)
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
         return reinit_ptrs
 
     def get_sparse_params(self) -> List[nn.Parameter]:
-        """Returns all embedding table parameters (optimized with Adagrad)."""
+        """返回所有 Embedding 参数，trainer.py 会用 Adagrad 优化它们。"""
         sparse_params = set()
         for module in self.modules():
             if isinstance(module, nn.Embedding):
@@ -1794,7 +1817,7 @@ class PCVRHyFormer(nn.Module):
         return [p for p in self.parameters() if p.data_ptr() in sparse_params]
 
     def get_dense_params(self) -> List[nn.Parameter]:
-        """Returns all non-embedding parameters (optimized with AdamW)."""
+        """返回所有非 Embedding 参数，trainer.py 会用 AdamW 优化它们。"""
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
@@ -1806,14 +1829,21 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        calendar_feats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
+        """把某个序列域从原始 side-info ID 编码成 event token。
+
+        输入 ``seq`` 形状是 ``[B, S, L]``，S 是该序列域的 side-info 特征数。每个
+        side-info 特征先独立查 Embedding，随后在最后一维拼接，得到
+        ``[B, L, S*emb_dim]``，再投影成 ``[B, L, D]``。如果启用 time bucket，
+        每个事件 token 会额外加上对应的时间差 Embedding。
+        """
         B, S, L = seq.shape
         emb_list = []
         for i in range(S):
             real_idx = emb_index[i] if i < len(emb_index) else -1
             if real_idx == -1:
-                # Feature skipped by emb_skip_threshold: output zero vector
+                # 被过滤的序列 side-info 特征使用零向量占位，保持拼接维度不变。
                 emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
             else:
                 emb = sideinfo_embs[real_idx]
@@ -1824,16 +1854,24 @@ class PCVRHyFormer(nn.Module):
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
-        # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
+        # 加上时间差 bucket Embedding；padding id=0 会产生零向量。
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        if self.use_seq_calendar_features and calendar_feats is not None:
+            calendar_emb = (
+                self.seq_calendar_embeddings['hour_of_day'](calendar_feats[:, 0, :])
+                + self.seq_calendar_embeddings['day_of_week'](calendar_feats[:, 1, :])
+                + self.seq_calendar_embeddings['day_of_month'](calendar_feats[:, 2, :])
+            )
+            token_emb = token_emb + self.seq_calendar_alpha * calendar_emb
 
         return token_emb
 
     def _make_padding_mask(
         self, seq_len: torch.Tensor, max_len: int
     ) -> torch.Tensor:
-        """Generates a padding mask from sequence lengths."""
+        """根据有效序列长度生成 padding mask。"""
         device = seq_len.device
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
@@ -1846,7 +1884,7 @@ class PCVRHyFormer(nn.Module):
         seq_masks_list: list,
         apply_dropout: bool = True
     ) -> torch.Tensor:
-        """Runs the multi-sequence block stack with dropout and output projection."""
+        """执行多层 HyFormer block，并把最终 Q token 聚合成一个样本向量。"""
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
@@ -1858,7 +1896,7 @@ class PCVRHyFormer(nn.Module):
         curr_masks = seq_masks_list
 
         for block in self.blocks:
-            # Precompute RoPE cos/sin for each sequence
+            # 每层 block 前为当前各序列长度准备 RoPE cos/sin。
             rope_cos_list = None
             rope_sin_list = None
             if self.rotary_emb is not None:
@@ -1880,7 +1918,7 @@ class PCVRHyFormer(nn.Module):
                 rope_sin_list=rope_sin_list,
             )
 
-        # Output: concatenate all sequences' Q tokens then project via MLP
+        # 输出阶段只使用各序列域的 Q token：先拼接，再投影回 d_model。
         B = curr_qs[0].shape[0]
         all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
         output = all_q.view(B, -1)  # (B, Nq*S*D)
@@ -1927,11 +1965,11 @@ class PCVRHyFormer(nn.Module):
         return torch.cat(ns_parts, dim=1)
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: generic user/item tokens plus optional shared-fid tuple token.
+        """执行训练阶段 forward，返回 logits。"""
+        # 1. 构造 NS token：user/item generic token、可选 tuple token、dense token。
         ns_tokens = self._build_ns_tokens(inputs)
 
-        # 2. Embed each sequence domain (dynamic)
+        # 2. 将每个序列域的 [B, S, L] side-info ID 编码成 [B, L, D] event token。
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
@@ -1939,28 +1977,29 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_calendar_feats[domain] if inputs.seq_calendar_feats is not None else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
+        # 3. 每个序列域根据 NS token 和自身 summary 生成独立 Q token。
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
+        # 4. 多层 HyFormer block 中完成 query-sequence 交互和 Q/NS token 交叉。
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
         output = self._apply_engineered_dense(output, inputs.engineered_dense_feats)
 
-        # 5. Classifier
+        # 5. 分类头输出 logit。
         logits = self.clsfier(output)  # (B, action_num)
         return logits
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Runs inference without dropout, returning both logits and embeddings."""
-        # Reuses forward logic but without dropout
+        """执行推理路径，关闭 dropout，并同时返回 logits 和最终 embedding。"""
+        # 和 forward 使用同一条主路径，只是在 block stack 中关闭 dropout。
         ns_tokens = self._build_ns_tokens(inputs)
 
         seq_tokens_list = []
@@ -1970,7 +2009,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_calendar_feats[domain] if inputs.seq_calendar_feats is not None else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

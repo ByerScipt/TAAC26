@@ -16,6 +16,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}，S 是该序列域的 side-info 数
     seq_lens: dict        # {domain: tensor [B]}，每个样本的有效序列长度
     seq_time_buckets: dict  # {domain: tensor [B, L]}，每个事件的时间差 bucket
+    seq_calendar_feats: Optional[dict] = None  # {domain: tensor [B, 3, L]} event calendar ids
     engineered_dense_feats: Optional[torch.Tensor] = None
 
 
@@ -1380,6 +1381,7 @@ class PCVRHyFormer(nn.Module):
         seq_causal: bool = False,
         action_num: int = 1,
         num_time_buckets: int = 65,
+        use_seq_calendar_features: bool = True,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1405,6 +1407,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # 固定顺序，保证训练和推理一致。
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
+        self.use_seq_calendar_features = use_seq_calendar_features
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1610,6 +1613,14 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        if self.use_seq_calendar_features:
+            self.seq_calendar_embeddings = nn.ModuleDict({
+                'hour_of_day': nn.Embedding(25, d_model, padding_idx=0),
+                'day_of_week': nn.Embedding(8, d_model, padding_idx=0),
+                'day_of_month': nn.Embedding(32, d_model, padding_idx=0),
+            })
+            self.seq_calendar_alpha = nn.Parameter(torch.zeros(1))
+
         # ================== HyFormer 组件 ==================
         # MultiSeqQueryGenerator 根据 NS token 和序列 summary 生成每路 query token。
         self.query_generator = MultiSeqQueryGenerator(
@@ -1714,6 +1725,11 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        if self.use_seq_calendar_features:
+            for emb in self.seq_calendar_embeddings.values():
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
@@ -1785,6 +1801,8 @@ class PCVRHyFormer(nn.Module):
         # time_embedding 始终保留。
         if self.num_time_buckets > 0:
             skip_count += 1
+        if self.use_seq_calendar_features:
+            skip_count += len(self.seq_calendar_embeddings)
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1811,6 +1829,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        calendar_feats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """把某个序列域从原始 side-info ID 编码成 event token。
 
@@ -1838,6 +1857,14 @@ class PCVRHyFormer(nn.Module):
         # 加上时间差 bucket Embedding；padding id=0 会产生零向量。
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        if self.use_seq_calendar_features and calendar_feats is not None:
+            calendar_emb = (
+                self.seq_calendar_embeddings['hour_of_day'](calendar_feats[:, 0, :])
+                + self.seq_calendar_embeddings['day_of_week'](calendar_feats[:, 1, :])
+                + self.seq_calendar_embeddings['day_of_month'](calendar_feats[:, 2, :])
+            )
+            token_emb = token_emb + self.seq_calendar_alpha * calendar_emb
 
         return token_emb
 
@@ -1950,7 +1977,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_calendar_feats[domain] if inputs.seq_calendar_feats is not None else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1981,7 +2009,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_calendar_feats[domain] if inputs.seq_calendar_feats is not None else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

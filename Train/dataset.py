@@ -133,6 +133,14 @@ BUCKET_BOUNDARIES = np.array([
 # 因此 train.py / infer.py 只暴露 ``--use_time_buckets`` 开关，具体桶数统一从这里派生。
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+SEQ_CALENDAR_FEATURE_NAMES = (
+    'hour_of_day',
+    'day_of_week',
+    'day_of_month',
+)
+SEQ_CALENDAR_FEATURE_DIM = len(SEQ_CALENDAR_FEATURE_NAMES)
+LOCAL_TIME_OFFSET_SECONDS = 8 * 3600
+
 ENGINEERED_DENSE_DOMAINS = ('seq_a', 'seq_b', 'seq_c', 'seq_d')
 ENGINEERED_DENSE_FEATURE_NAMES = [
     f'{domain}_{feature}'
@@ -241,6 +249,7 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_calendar = {}
         self._buf_seq_lens = {}
         self._buf_engineered_dense = np.zeros((B, ENGINEERED_DENSE_DIM), dtype=np.float32)
         for domain in self.seq_domains:
@@ -248,6 +257,8 @@ class PCVRParquetDataset(IterableDataset):
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_calendar[domain] = np.zeros(
+                (B, SEQ_CALENDAR_FEATURE_DIM, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- 为 int 列提前生成读取计划：(col_idx, offset, vocab_size) ----
@@ -551,6 +562,42 @@ class PCVRParquetDataset(IterableDataset):
 
         return feats
 
+    def _compute_seq_calendar_features(
+        self,
+        ts_padded: "npt.NDArray[np.int64]",
+    ) -> "npt.NDArray[np.int64]":
+        """Convert per-event unix timestamps into compact local-calendar ids.
+
+        Output shape is ``[B, 3, L]``. Every feature reserves id=0 for padding:
+        hour 1..24, day-of-week 1..7, day-of-month 1..31.
+        Timestamps are shifted to UTC+8 before calendar extraction
+        to match the competition logs' Beijing-time interpretation.
+        """
+        B, L = ts_padded.shape
+        calendar = np.zeros((B, SEQ_CALENDAR_FEATURE_DIM, L), dtype=np.int64)
+        valid = ts_padded > 0
+        if not valid.any():
+            return calendar
+
+        local_seconds = ts_padded[valid] + LOCAL_TIME_OFFSET_SECONDS
+        days = local_seconds // 86400
+        seconds_in_day = local_seconds % 86400
+
+        hour = seconds_in_day // 3600
+        # 1970-01-01 was Thursday. Monday=0, Sunday=6.
+        day_of_week = (days + 3) % 7
+
+        months = local_seconds.astype('datetime64[s]').astype('datetime64[M]')
+        day_of_month = (
+            local_seconds.astype('datetime64[s]').astype('datetime64[D]')
+            - months.astype('datetime64[D]')
+        ).astype(np.int64)
+
+        calendar[:, 0, :][valid] = hour + 1
+        calendar[:, 1, :][valid] = day_of_week + 1
+        calendar[:, 2, :][valid] = day_of_month + 1
+        return calendar
+
     def _pad_varlen_float_column(
         self,
         arrow_col: "pa.ListArray",
@@ -699,6 +746,8 @@ class PCVRParquetDataset(IterableDataset):
             # 时间差分桶：当前样本 timestamp 减去序列事件 timestamp。
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            calendar_feats = self._buf_seq_calendar[domain][:B]
+            calendar_feats[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -726,8 +775,10 @@ class PCVRParquetDataset(IterableDataset):
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
+                calendar_feats[:] = self._compute_seq_calendar_features(ts_padded)
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_calendar_feats'] = torch.from_numpy(calendar_feats.copy())
 
         return result
 

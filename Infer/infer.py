@@ -60,6 +60,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_causal': False,
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
+    'use_seq_calendar_features': True,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
@@ -360,6 +361,7 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_calendar_feats: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -367,6 +369,9 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_calendar_feats[domain] = device_batch.get(
+            f'{domain}_calendar_feats',
+            torch.zeros(B, 3, L, dtype=torch.long, device=device))
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
@@ -376,6 +381,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_calendar_feats=seq_calendar_feats,
         engineered_dense_feats=device_batch.get('engineered_dense_feats'),
     )
 
@@ -417,6 +423,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        return_user_id=True,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
