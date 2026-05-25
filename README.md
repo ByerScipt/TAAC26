@@ -64,7 +64,7 @@
 
 ### calendar_tokens
 
-在序列序列侧额外加入calendar token，包含hour-of-day、day-of-week、day-of-month。
+在序列侧额外加入calendar token，包含hour-of-day、day-of-week、day-of-month。
 
 ### time_din
 
