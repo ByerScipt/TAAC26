@@ -179,6 +179,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        clean_dense_nonfinite: bool = False,
     ) -> None:
         """
         Args:
@@ -214,6 +215,7 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.clean_dense_nonfinite = clean_dense_nonfinite
 
         # Build the list of Row Groups.
         self._rg_list = []
@@ -488,9 +490,8 @@ class PCVRParquetDataset(IterableDataset):
                 continue
             use_len = min(raw_len, max_dim)
             slice_vals = values[start:start + use_len]
-            # Guard against upstream dirty float payloads (NaN/Inf) that can
-            # poison model activations and training loss.
-            slice_vals = np.where(np.isfinite(slice_vals), slice_vals, 0.0)
+            if self.clean_dense_nonfinite:
+                slice_vals = np.where(np.isfinite(slice_vals), slice_vals, 0.0)
             padded[i, :use_len] = slice_vals
 
         return padded
@@ -679,6 +680,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    clean_dense_nonfinite: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -727,6 +729,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        clean_dense_nonfinite=clean_dense_nonfinite,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -749,6 +752,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        clean_dense_nonfinite=clean_dense_nonfinite,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

@@ -11,7 +11,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --num_queries 3 \
-    --num_epochs 6 \
+    --num_epochs 8 \
     --ns_groups_json "" \
     --compile_model \
     --emb_skip_threshold 1000000 \

@@ -62,6 +62,7 @@ _FALLBACK_MODEL_CFG = {
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
     'rank_mixer_mode': 'full',
+    'use_rank_mixer_moe': False,
     'rank_mixer_moe_num_experts': 8,
     'rank_mixer_moe_top_k': 2,
     'use_rope': False,
@@ -72,6 +73,7 @@ _FALLBACK_MODEL_CFG = {
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
     'multi_scale_queries': False,
+    'stabilize_user_dense': False,
     'q_dropout_mult': 1.0,
 }
 
@@ -165,6 +167,12 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
 
         if key in train_config:
             cfg[key] = train_config[key]
+        elif key == 'use_rank_mixer_moe' and train_config:
+            # Legacy sparse-MoE checkpoints predate this explicit switch. They
+            # wrote rank_mixer_moe_* hyperparameters but no boolean flag.
+            cfg[key] = 'rank_mixer_moe_num_experts' in train_config
+            logging.warning(
+                f"train_config missing '{key}', using legacy inferred value = {cfg[key]}")
         else:
             cfg[key] = _FALLBACK_MODEL_CFG[key]
             logging.warning(
@@ -622,6 +630,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        clean_dense_nonfinite=bool(train_config.get('clean_dense_nonfinite', False)),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

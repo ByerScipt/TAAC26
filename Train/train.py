@@ -147,6 +147,9 @@ def parse_args() -> argparse.Namespace:
                         help='Number of experts in RankMixer sparse MoE FFN')
     parser.add_argument('--rank_mixer_moe_top_k', type=int, default=2,
                         help='Top-k experts selected per token in RankMixer sparse MoE FFN')
+    parser.add_argument('--use_rank_mixer_moe', action='store_true', default=False,
+                        help='Enable token-level sparse MoE inside RankMixer '
+                             '(default off: use dense RankMixer FFN)')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -193,6 +196,12 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
+    parser.add_argument('--clean_dense_nonfinite', action='store_true', default=False,
+                        help='Replace NaN/Inf dense feature values with 0 in the dataset '
+                             '(default off).')
+    parser.add_argument('--stabilize_user_dense', action='store_true', default=False,
+                        help='Apply nan_to_num and fp32 log1p transform inside the '
+                             'user-dense tokenizer (default off).')
 
     # Training acceleration.
     parser.add_argument('--grad_accumulation_steps', type=int, default=1,
@@ -308,6 +317,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        clean_dense_nonfinite=args.clean_dense_nonfinite,
     )
 
     # ---- NS groups ----
@@ -355,6 +365,7 @@ def main() -> None:
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,
+        "use_rank_mixer_moe": args.use_rank_mixer_moe,
         "rank_mixer_moe_num_experts": args.rank_mixer_moe_num_experts,
         "rank_mixer_moe_top_k": args.rank_mixer_moe_top_k,
         "use_rope": args.use_rope,
@@ -366,6 +377,7 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "multi_scale_queries": args.multi_scale_queries,
         "user_dense_feature_specs": user_dense_feature_specs,
+        "stabilize_user_dense": args.stabilize_user_dense,
         "q_dropout_mult": args.q_dropout_mult,
     }
 
@@ -385,7 +397,8 @@ def main() -> None:
     logging.info(
         f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
         f"rank_mixer_mode={model_for_log.rank_mixer_mode}, "
-        f"multi_scale_queries={args.multi_scale_queries}"
+        f"multi_scale_queries={args.multi_scale_queries}, "
+        f"use_rank_mixer_moe={args.use_rank_mixer_moe}"
     )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")

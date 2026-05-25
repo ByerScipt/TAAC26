@@ -334,6 +334,7 @@ class RankMixerBlock(nn.Module):
         hidden_mult: int = 4,
         dropout: float = 0.0,
         mode: str = 'full',  # 'full' | 'ffn_only' | 'none'
+        use_sparse_moe: bool = False,
         moe_num_experts: int = 4,
         moe_top_k: int = 2,
     ) -> None:
@@ -353,28 +354,33 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        if moe_num_experts <= 0:
-            raise ValueError(f"moe_num_experts must be positive, got {moe_num_experts}")
-        if moe_top_k <= 0:
-            raise ValueError(f"moe_top_k must be positive, got {moe_top_k}")
-        if moe_top_k > moe_num_experts:
-            raise ValueError(
-                f"moe_top_k ({moe_top_k}) cannot exceed moe_num_experts ({moe_num_experts})"
-            )
-
+        self.use_sparse_moe = use_sparse_moe
         self.moe_num_experts = moe_num_experts
         self.moe_top_k = moe_top_k
 
-        # Token-level sparse MoE FFN — used by both 'full' and 'ffn_only'
         self.norm = nn.LayerNorm(d_model)
         hidden_dim = d_model * hidden_mult
-        self.router = nn.Linear(d_model, moe_num_experts)
-        self.experts_fc1 = nn.ModuleList([
-            nn.Linear(d_model, hidden_dim) for _ in range(moe_num_experts)
-        ])
-        self.experts_fc2 = nn.ModuleList([
-            nn.Linear(hidden_dim, d_model) for _ in range(moe_num_experts)
-        ])
+        if self.use_sparse_moe:
+            if moe_num_experts <= 0:
+                raise ValueError(f"moe_num_experts must be positive, got {moe_num_experts}")
+            if moe_top_k <= 0:
+                raise ValueError(f"moe_top_k must be positive, got {moe_top_k}")
+            if moe_top_k > moe_num_experts:
+                raise ValueError(
+                    f"moe_top_k ({moe_top_k}) cannot exceed moe_num_experts ({moe_num_experts})"
+                )
+            # Optional token-level sparse MoE FFN.
+            self.router = nn.Linear(d_model, moe_num_experts)
+            self.experts_fc1 = nn.ModuleList([
+                nn.Linear(d_model, hidden_dim) for _ in range(moe_num_experts)
+            ])
+            self.experts_fc2 = nn.ModuleList([
+                nn.Linear(hidden_dim, d_model) for _ in range(moe_num_experts)
+            ])
+        else:
+            # Dense RankMixer FFN path, matching the original HyFormer-style block.
+            self.fc1 = nn.Linear(d_model, hidden_dim)
+            self.fc2 = nn.Linear(hidden_dim, d_model)
         self.dropout = nn.Dropout(dropout)
         # Post-LN after residual to stabilize stacked block outputs
         self.post_norm = nn.LayerNorm(d_model)
@@ -423,33 +429,38 @@ class RankMixerBlock(nn.Module):
         else:  # 'ffn_only'
             Q_hat = Q
 
-        # Token-level sparse MoE FFN
         x = self.norm(Q_hat)
-        B, T, D = x.shape
-        x_flat = x.reshape(B * T, D)
+        if self.use_sparse_moe:
+            B, T, D = x.shape
+            x_flat = x.reshape(B * T, D)
 
-        # Router per token: (B*T, E)
-        router_logits = self.router(x_flat)
-        topk_logits, topk_indices = torch.topk(router_logits, k=self.moe_top_k, dim=-1)
-        topk_gates = F.softmax(topk_logits, dim=-1).to(x_flat.dtype)
+            # Router per token: (B*T, E)
+            router_logits = self.router(x_flat)
+            topk_logits, topk_indices = torch.topk(router_logits, k=self.moe_top_k, dim=-1)
+            topk_gates = F.softmax(topk_logits, dim=-1).to(x_flat.dtype)
 
-        # Sparse dispatch: only selected expert paths are evaluated.
-        out_flat = torch.zeros_like(x_flat)
-        for expert_id in range(self.moe_num_experts):
-            token_pos, slot_pos = torch.where(topk_indices == expert_id)
-            if token_pos.numel() == 0:
-                continue
+            # Sparse dispatch: only selected expert paths are evaluated.
+            out_flat = torch.zeros_like(x_flat)
+            for expert_id in range(self.moe_num_experts):
+                token_pos, slot_pos = torch.where(topk_indices == expert_id)
+                if token_pos.numel() == 0:
+                    continue
 
-            expert_in = x_flat.index_select(0, token_pos)
-            expert_out = self.experts_fc1[expert_id](expert_in)
-            expert_out = F.gelu(expert_out)
-            expert_out = self.dropout(expert_out)
-            expert_out = self.experts_fc2[expert_id](expert_out)
+                expert_in = x_flat.index_select(0, token_pos)
+                expert_out = self.experts_fc1[expert_id](expert_in)
+                expert_out = F.gelu(expert_out)
+                expert_out = self.dropout(expert_out)
+                expert_out = self.experts_fc2[expert_id](expert_out)
 
-            gates = topk_gates[token_pos, slot_pos].unsqueeze(-1)
-            out_flat.index_add_(0, token_pos, expert_out * gates)
+                gates = topk_gates[token_pos, slot_pos].unsqueeze(-1)
+                out_flat.index_add_(0, token_pos, expert_out * gates)
 
-        Q_e = out_flat.view(B, T, D)
+            Q_e = out_flat.view(B, T, D)
+        else:
+            x = self.fc1(x)
+            x = F.gelu(x)
+            x = self.dropout(x)
+            Q_e = self.fc2(x)
 
         # Residual from original Q
         Q_boost = Q + Q_e
@@ -948,6 +959,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         causal: bool = False,
         rank_mixer_mode: str = 'full',
         multi_scale_queries: bool = False,
+        use_rank_mixer_moe: bool = False,
         rank_mixer_moe_num_experts: int = 4,
         rank_mixer_moe_top_k: int = 2,
     ) -> None:
@@ -992,6 +1004,7 @@ class MultiSeqHyFormerBlock(nn.Module):
             hidden_mult=hidden_mult,
             dropout=dropout,
             mode=rank_mixer_mode,
+            use_sparse_moe=use_rank_mixer_moe,
             moe_num_experts=rank_mixer_moe_num_experts,
             moe_top_k=rank_mixer_moe_top_k,
         )
@@ -1359,16 +1372,22 @@ class UserDenseFusionTokenizer(nn.Module):
         dense_specs: List[Tuple[int, int, int]],
         d_model: int,
         fallback_input_dim: int,
+        stabilize_user_dense: bool = False,
     ) -> None:
         super().__init__()
         self._d = d_model
+        self.stabilize_user_dense = stabilize_user_dense
         self._slice = {fid: (offset, length) for fid, offset, length in dense_specs}
 
-        self._fallback_dense = nn.Sequential(
-            nn.Linear(fallback_input_dim, d_model),
-            nn.LayerNorm(d_model),
-        )
         self._use_fallback_only = len(dense_specs) == 0
+        self._fallback_dense = (
+            nn.Sequential(
+                nn.Linear(fallback_input_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            if self._use_fallback_only
+            else None
+        )
 
         self._ranges = {
             name: [self._slice[f] for f in fids if f in self._slice]
@@ -1431,8 +1450,8 @@ class UserDenseFusionTokenizer(nn.Module):
         return base
 
     def forward(self, user_dense: torch.Tensor) -> torch.Tensor:
-        # Defensive cleanup in case non-finite payload slips past data pipeline.
-        user_dense = torch.nan_to_num(user_dense, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.stabilize_user_dense:
+            user_dense = torch.nan_to_num(user_dense, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self._use_fallback_only:
             return F.silu(self._fallback_dense(user_dense)).unsqueeze(1)
@@ -1440,12 +1459,13 @@ class UserDenseFusionTokenizer(nn.Module):
         # intentionally process in non-source order: stat -> quantile -> ads -> sum
         if self._stat_head is not None and len(self._ranges["stat_bucket"]) > 0:
             stat_v = self._collect_by_mask(user_dense, self._ranges["stat_bucket"])
-            # Keep clamp/log transform in FP32 to avoid AMP fp16 overflow
-            # (1.5e9 exceeds fp16 finite range and can become inf before log1p).
-            stat_fp32 = stat_v.float()
-            stat_fp32 = torch.clamp(stat_fp32, min=0.0, max=1_500_000_000.0)
-            stat_fp32 = torch.log1p(stat_fp32)
-            stat_v = stat_fp32.to(dtype=stat_v.dtype)
+            if self.stabilize_user_dense:
+                stat_fp32 = stat_v.float()
+                stat_fp32 = torch.clamp(stat_fp32, min=0.0, max=1_500_000_000.0)
+                stat_fp32 = torch.log1p(stat_fp32)
+                stat_v = stat_fp32.to(dtype=stat_v.dtype)
+            else:
+                stat_v = torch.log1p(stat_v.clamp(min=0.0, max=1_500_000_000.0))
             stat_repr = F.silu(self._stat_head(stat_v))
         else:
             stat_repr = self._zero(user_dense)
@@ -1503,6 +1523,7 @@ class PCVRHyFormer(nn.Module):
         action_num: int = 1,
         num_time_buckets: int = 65,
         rank_mixer_mode: str = 'full',
+        use_rank_mixer_moe: bool = False,
         rank_mixer_moe_num_experts: int = 4,
         rank_mixer_moe_top_k: int = 2,
         use_rope: bool = False,
@@ -1515,6 +1536,7 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         multi_scale_queries: bool = False,
         user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
+        stabilize_user_dense: bool = False,
         # query 侧可单独加大 dropout，降低对短期时间模式的依赖。
         q_dropout_mult: float = 1.0,
     ) -> None:
@@ -1592,6 +1614,12 @@ class PCVRHyFormer(nn.Module):
                 dense_specs=user_dense_feature_specs or [],
                 d_model=d_model,
                 fallback_input_dim=user_dense_dim,
+                stabilize_user_dense=stabilize_user_dense,
+            )
+            logging.info(
+                "UserDenseFusionTokenizer: fallback_dense=%s, stabilize_user_dense=%s",
+                self.user_dense_proj._fallback_dense is not None,
+                self.user_dense_proj.stabilize_user_dense,
             )
 
         # Item dense feature projection (if available)
@@ -1721,6 +1749,7 @@ class PCVRHyFormer(nn.Module):
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
                 multi_scale_queries=multi_scale_queries,
+                use_rank_mixer_moe=use_rank_mixer_moe,
                 rank_mixer_moe_num_experts=rank_mixer_moe_num_experts,
                 rank_mixer_moe_top_k=rank_mixer_moe_top_k,
             )
