@@ -9,5 +9,5 @@ step,date,experiment,source,key_change,local_auc,local_loss,online_auc,online_de
 7,2026-05-13,time_tokens,TAAC2026/multi_scale_time_token,Add explicit current-time non-sequence tokens,0.8671137,0.220959,0.828348,0.000690
 8,2026-05-21,core_refactor,TAAC2026/official_recuni_multiscale,Rebuild the core model with validated time and stability modules,0.8675917,0.253418,0.829255,0.000907
 9,2026-05-21,sparse_moe,TAAC2026/sparse_moe_v5,Add token-level sparse MoE routing,0.86811,0.254258,0.829527,0.000272
-10,2026-05-22,feature_tokens,TAAC2026/fancy_tokenization,Add heterogeneous tokenization for dense tuple and quantile-like features,0.869321,0.253492,0.829901,0.000374
+10,2026-05-22,feature_tokens,TAAC2026/fancy_tokenization,Split user-dense tokenization into embedding-like stat-bucket and quantile-style feature paths,0.869321,0.253492,0.829901,0.000374
 11,2026-05-23,final_no_moe,TAAC2026/fancy_tokenization,Disable sparse MoE by default in the final heterogeneous tokenization model,0.868445,0.255211,0.830774,0.000873

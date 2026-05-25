@@ -34,7 +34,7 @@ The first two public commits (`baseline` and `bf16_amp`) follow the original roo
 | 7 | time_tokens | Explicit current-time context tokens | 0.8671137 | 0.220959 | 0.828348 |
 | 8 | core_refactor | Core rebuild based on additional ablations | 0.8675917 | 0.253418 | 0.829255 |
 | 9 | sparse_moe | Token-level sparse MoE | 0.86811 | 0.254258 | 0.829527 |
-| 10 | feature_tokens | Heterogeneous feature tokenization | 0.869321 | 0.253492 | 0.829901 |
+| 10 | feature_tokens | User-dense tokenization by feature type | 0.869321 | 0.253492 | 0.829901 |
 | 11 | final_no_moe | Keep heterogeneous tokenization and disable MoE by default | 0.868445 | 0.255211 | 0.830774 |
 
 ## Experiment Notes
@@ -99,10 +99,10 @@ A minimal token-level sparse MoE is added: each token selects the top 2 experts 
 
 ### feature_tokens
 
-The input tokenization is split by feature type:
+The user-dense tokenization is split by feature type:
 
 - fields `61` and `87` as embedding-like dense tokens
-- fields `62-66` as tuple tokens
+- fields `62-66` as stat-bucket dense features with `clamp` followed by `log1p` before projection
 - fields `89-91` as quantile-style feature tokens
 
 ### final_no_moe

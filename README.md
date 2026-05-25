@@ -34,7 +34,7 @@
 | 7 | time_tokens | 显式当前时间 NS token | 0.8671137 | 0.220959 | 0.828348 |
 | 8 | core_refactor | 基于额外消融重构核心模型 | 0.8675917 | 0.253418 | 0.829255 |
 | 9 | sparse_moe | token-level sparse MoE | 0.86811 | 0.254258 | 0.829527 |
-| 10 | feature_tokens | 异质特征 tokenization | 0.869321 | 0.253492 | 0.829901 |
+| 10 | feature_tokens | 按特征类型拆分 user-dense tokenization | 0.869321 | 0.253492 | 0.829901 |
 | 11 | final_no_moe | 保留异质 tokenization，默认关闭 MoE | 0.868445 | 0.255211 | 0.830774 |
 
 ## 实验说明
@@ -99,10 +99,10 @@
 
 ### feature_tokens
 
-按特征类型拆分输入侧 tokenization：
+按特征类型拆分 user-dense tokenization：
 
 - 字段 `61` 和 `87`：embedding-like dense token
-- 字段 `62-66`：tuple token
+- 字段 `62-66`：stat-bucket dense features，先 `clamp` 再 `log1p` 后投影
 - 字段 `89-91`：quantile-style feature token
 
 ### final_no_moe
