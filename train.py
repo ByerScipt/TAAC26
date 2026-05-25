@@ -81,6 +81,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
+    parser.add_argument('--log_every_n_steps', type=int, default=50,
+                        help='Write train loss / tqdm postfix and print profiling every N steps')
+    parser.add_argument('--max_train_steps', type=int, default=0,
+                        help='Profiling-only step cap; 0 means no limit')
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="none",
+        choices=["none", "bf16"],
+        help="AMP dtype for autocast speed probe. none disables AMP; bf16 enables torch.autocast with bfloat16.",
+    )
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
@@ -349,6 +360,9 @@ def main() -> None:
         schema_path=schema_path,
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
+        log_every_n_steps=args.log_every_n_steps,
+        max_train_steps=args.max_train_steps,
+        amp_dtype=args.amp_dtype,
         train_config=vars(args),
     )
 

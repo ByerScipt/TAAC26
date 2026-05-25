@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -57,6 +58,9 @@ class PCVRHyFormerRankingTrainer:
         schema_path: Optional[str] = None,
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
+        log_every_n_steps: int = 50,
+        max_train_steps: int = 0,
+        amp_dtype: str = "none",
         train_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.model: nn.Module = model
@@ -106,7 +110,21 @@ class PCVRHyFormerRankingTrainer:
         self.sparse_weight_decay: float = sparse_weight_decay
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
+        self.log_every_n_steps: int = max(1, log_every_n_steps)
+        self.max_train_steps: int = max(0, max_train_steps)
+        self.amp_dtype = amp_dtype
+        self.amp_enabled = amp_dtype != "none" and str(self.device).startswith("cuda")
         self.train_config: Optional[Dict[str, Any]] = train_config
+
+        logging.info(f"amp_dtype={self.amp_dtype}")
+        if self.amp_dtype == "bf16" and self.amp_enabled:
+            if not torch.cuda.is_bf16_supported():
+                logging.warning("BF16 AMP requested but torch.cuda.is_bf16_supported() is False; disabling AMP.")
+                self.amp_enabled = False
+            else:
+                logging.info("BF16 AMP enabled.")
+        else:
+            logging.info("AMP disabled.")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -204,14 +222,29 @@ class PCVRHyFormerRankingTrainer:
             logging.info(f"Removed old best_model dir: {old_dir}")
 
     def _batch_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Move all tensors in ``batch`` to ``self.device`` (``non_blocking=True``,
-        to cooperate with ``pin_memory``). Non-tensor values pass through.
+        """Move only forward/eval tensors to ``self.device``.
+
+        Raw metadata such as ``timestamp`` and ``user_id`` stays on CPU because
+        the model forward path does not consume it.
         """
-        device_batch: Dict[str, Any] = {}
+        seq_domains = batch['_seq_domains']
+        needed_tensor_keys = {
+            'user_int_feats',
+            'user_dense_feats',
+            'item_int_feats',
+            'item_dense_feats',
+            'label',
+        }
+        for domain in seq_domains:
+            needed_tensor_keys.add(domain)
+            needed_tensor_keys.add(f'{domain}_len')
+            needed_tensor_keys.add(f'{domain}_time_bucket')
+
+        device_batch: Dict[str, Any] = {'_seq_domains': seq_domains}
         for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
+            if isinstance(v, torch.Tensor) and k in needed_tensor_keys:
                 device_batch[k] = v.to(self.device, non_blocking=True)
-            else:
+            elif not isinstance(v, torch.Tensor) or k not in needed_tensor_keys:
                 device_batch[k] = v
         return device_batch
 
@@ -286,6 +319,36 @@ class PCVRHyFormerRankingTrainer:
             self._save_step_checkpoint(
                 total_step, is_best=True, skip_model_file=True)
 
+    def _log_train_profile(
+        self,
+        total_step: int,
+        step_time_sum: float,
+        batch_to_device_time_sum: float,
+        fwd_bwd_opt_time_sum: float,
+        samples: int,
+        steps: int,
+    ) -> None:
+        """Log interval-level training throughput and timing."""
+        if steps <= 0:
+            return
+        samples_per_sec = samples / step_time_sum if step_time_sum > 0 else 0.0
+        max_gpu_allocated_mb = 0.0
+        if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+            max_gpu_allocated_mb = (
+                torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+            )
+        logging.info(
+            "[TrainProfile] "
+            f"step={total_step} interval_steps={steps} "
+            f"avg_step_time={step_time_sum / steps:.6f}s "
+            f"avg_batch_to_device_time={batch_to_device_time_sum / steps:.6f}s "
+            f"avg_forward_backward_optimizer_time={fwd_bwd_opt_time_sum / steps:.6f}s "
+            f"samples_per_sec={samples_per_sec:.2f} "
+            f"max_gpu_allocated_mb={max_gpu_allocated_mb:.2f}"
+        )
+        if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+            torch.cuda.reset_peak_memory_stats(self.device)
+
     def train(self) -> None:
         """Main training loop: iterates over epochs, performs step-level and
         epoch-level validation, triggers EarlyStopping and the periodic sparse
@@ -294,21 +357,69 @@ class PCVRHyFormerRankingTrainer:
         print("Start training (PCVRHyFormer)")
         self.model.train()
         total_step = 0
+        if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+            torch.cuda.reset_peak_memory_stats(self.device)
 
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
+            profile_steps = 0
+            profile_samples = 0
+            profile_step_time_sum = 0.0
+            profile_batch_to_device_time_sum = 0.0
+            profile_fwd_bwd_opt_time_sum = 0.0
 
             for step, batch in train_pbar:
-                loss = self._train_step(batch)
+                (
+                    loss,
+                    step_time,
+                    batch_to_device_time,
+                    fwd_bwd_opt_time,
+                    sample_count,
+                ) = self._train_step(batch)
                 total_step += 1
                 loss_sum += loss
+                profile_steps += 1
+                profile_samples += sample_count
+                profile_step_time_sum += step_time
+                profile_batch_to_device_time_sum += batch_to_device_time
+                profile_fwd_bwd_opt_time_sum += fwd_bwd_opt_time
 
-                if self.writer:
+                if self.writer and total_step % self.log_every_n_steps == 0:
                     self.writer.add_scalar('Loss/train', loss, total_step)
 
-                train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                if total_step % self.log_every_n_steps == 0:
+                    train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                    self._log_train_profile(
+                        total_step=total_step,
+                        step_time_sum=profile_step_time_sum,
+                        batch_to_device_time_sum=profile_batch_to_device_time_sum,
+                        fwd_bwd_opt_time_sum=profile_fwd_bwd_opt_time_sum,
+                        samples=profile_samples,
+                        steps=profile_steps,
+                    )
+                    profile_steps = 0
+                    profile_samples = 0
+                    profile_step_time_sum = 0.0
+                    profile_batch_to_device_time_sum = 0.0
+                    profile_fwd_bwd_opt_time_sum = 0.0
+
+                if self.max_train_steps > 0 and total_step >= self.max_train_steps:
+                    if profile_steps > 0:
+                        self._log_train_profile(
+                            total_step=total_step,
+                            step_time_sum=profile_step_time_sum,
+                            batch_to_device_time_sum=profile_batch_to_device_time_sum,
+                            fwd_bwd_opt_time_sum=profile_fwd_bwd_opt_time_sum,
+                            samples=profile_samples,
+                            steps=profile_steps,
+                        )
+                    logging.info(
+                        f"Reached max_train_steps={self.max_train_steps}; "
+                        "stopping before validation/checkpoint for speed probe"
+                    )
+                    return
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
@@ -399,23 +510,34 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
         )
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
-        """Run a single training step and return the scalar loss value."""
+    def _train_step(self, batch: Dict[str, Any]) -> Tuple[float, float, float, float, int]:
+        """Run a single training step and return loss plus lightweight timings."""
+        step_t0 = time.perf_counter()
+        move_t0 = time.perf_counter()
         device_batch = self._batch_to_device(batch)
+        batch_to_device_time = time.perf_counter() - move_t0
         label = device_batch['label'].float()
+        sample_count = int(label.numel())
 
+        fwd_bwd_opt_t0 = time.perf_counter()
         self.dense_optimizer.zero_grad()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.zero_grad()
 
-        model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        amp_dtype = torch.bfloat16 if self.amp_dtype == "bf16" else torch.float32
+        with torch.autocast(
+            device_type="cuda",
+            dtype=amp_dtype,
+            enabled=self.amp_enabled,
+        ):
+            model_input = self._make_model_input(device_batch)
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-        else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
@@ -425,7 +547,9 @@ class PCVRHyFormerRankingTrainer:
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
 
-        return loss.item()
+        fwd_bwd_opt_time = time.perf_counter() - fwd_bwd_opt_t0
+        step_time = time.perf_counter() - step_t0
+        return loss.item(), step_time, batch_to_device_time, fwd_bwd_opt_time, sample_count
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
@@ -446,10 +570,10 @@ class PCVRHyFormerRankingTrainer:
         with torch.no_grad():
             for step, batch in pbar:
                 logits, labels = self._evaluate_step(batch)
-                all_logits_list.append(logits.detach().cpu())
+                all_logits_list.append(logits.detach().float().cpu())
                 all_labels_list.append(labels.detach().cpu())
 
-        all_logits = torch.cat(all_logits_list, dim=0)
+        all_logits = torch.cat(all_logits_list, dim=0).float()
         all_labels = torch.cat(all_labels_list, dim=0).long()
 
         # Binary AUC via sklearn.
@@ -487,8 +611,14 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label']
 
-        model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
-        logits = logits.squeeze(-1)  # (B,)
+        amp_dtype = torch.bfloat16 if self.amp_dtype == "bf16" else torch.float32
+        with torch.autocast(
+            device_type="cuda",
+            dtype=amp_dtype,
+            enabled=self.amp_enabled,
+        ):
+            model_input = self._make_model_input(device_batch)
+            logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+            logits = logits.squeeze(-1).float()  # (B,)
 
         return logits, label
