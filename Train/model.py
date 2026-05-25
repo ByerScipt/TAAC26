@@ -5,7 +5,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Dict, List, NamedTuple, Tuple, Optional, Union
+
+LOCAL_TIME_OFFSET_SECONDS = 8 * 3600
 
 
 class ModelInput(NamedTuple):
@@ -13,6 +16,7 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    timestamp: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}，S 是该序列域的 side-info 数
     seq_lens: dict        # {domain: tensor [B]}，每个样本的有效序列长度
     seq_time_buckets: dict  # {domain: tensor [B, L]}，每个事件的时间差 bucket
@@ -419,7 +423,7 @@ class MultiSeqQueryGenerator(nn.Module):
     """多序列 query token 生成模块。
 
     每个序列域独立生成自己的 Q token。对第 i 个序列域：
-        GlobalInfo_i = Concat(所有 NS token 展平, MeanPool(Seq_i))
+        GlobalInfo_i = Concat(所有 NS token 展平, DINPool(Seq_i, candidate_item))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
 
     这样每一路序列都有专属 query，但 query 的生成会看到共享的 user/item NS 信息。
@@ -429,6 +433,8 @@ class MultiSeqQueryGenerator(nn.Module):
         self,
         d_model: int,
         num_ns: int,
+        num_item_ns: int,
+        has_item_dense: bool,
         num_queries: int,
         num_sequences: int,
         hidden_mult: int = 4
@@ -437,11 +443,36 @@ class MultiSeqQueryGenerator(nn.Module):
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.num_item_ns = num_item_ns
+        self.has_item_dense = has_item_dense
+        self.num_item_side_tokens = num_item_ns + (1 if has_item_dense else 0)
 
         global_info_dim = (num_ns + 1) * d_model
 
         # 对拼接后的 global_info 做 LayerNorm，稳定大维度拼接后的数值尺度。
         self.global_info_norm = nn.LayerNorm(global_info_dim)
+
+        # 将 item 侧所有 NS token（item_ns + 可选 item_dense）拼接后压缩到 d_model，
+        # 作为 DIN target-aware pooling 的 query。
+        item_concat_dim = self.num_item_side_tokens * d_model
+        self.item_query_norm = nn.LayerNorm(item_concat_dim)
+        self.item_query_mlp = nn.Sequential(
+            nn.Linear(item_concat_dim, d_model * hidden_mult),
+            nn.SiLU(),
+            nn.Linear(d_model * hidden_mult, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        # DIN-style target-aware pooling:
+        # score_t = MLP([q, k_t, q-k_t, q*k_t])，再对有效位置做 softmax 加权求和。
+        din_hidden_dim = d_model * hidden_mult
+        self.din_attn_mlp = nn.Sequential(
+            nn.Linear(4 * d_model, din_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(din_hidden_dim, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, 1),
+        )
 
         # 每个序列域拥有 N 个独立 FFN，分别生成 N 个 query token。
         self.query_ffns_per_seq = nn.ModuleList([
@@ -461,7 +492,8 @@ class MultiSeqQueryGenerator(nn.Module):
         self,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
+        time_context: Optional[torch.Tensor] = None,
     ) -> list:
         """为每个序列域生成 query token。
 
@@ -477,14 +509,37 @@ class MultiSeqQueryGenerator(nn.Module):
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
 
+        # 候选物品条件向量：取 item 侧全部 token（item_ns + 可选 item_dense）拼接，
+        # 再映射到 d_model。
+        item_side_tokens = ns_tokens[:, -self.num_item_side_tokens:, :]  # (B, K_item, D)
+        item_concat = item_side_tokens.reshape(B, -1)  # (B, K_item*D)
+        item_concat = self.item_query_norm(item_concat)
+        candidate_item = self.item_query_mlp(item_concat)  # (B, D)
+        if time_context is not None:
+            candidate_item = candidate_item + time_context
+
         q_tokens_list = []
         for i in range(self.num_sequences):
-            # 对当前序列域做 mask-aware mean pooling。
-            valid_mask = ~seq_padding_masks[i]  # True 表示有效位置。
-            valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
-            seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
-            seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-            seq_pooled = seq_sum / seq_count  # (B, D)
+            # DIN-style target-aware weighted pooling。
+            seq_tokens = seq_tokens_list[i]  # (B, L_i, D)
+            valid_mask = ~seq_padding_masks[i]  # (B, L_i), True 表示有效位置。
+
+            L_i = seq_tokens.shape[1]
+            query = candidate_item.unsqueeze(1).expand(-1, L_i, -1)  # (B, L_i, D)
+            attn_in = torch.cat(
+                [query, seq_tokens, query - seq_tokens, query * seq_tokens],
+                dim=-1,
+            )  # (B, L_i, 4D)
+            attn_logits = self.din_attn_mlp(attn_in).squeeze(-1)  # (B, L_i)
+            attn_logits = attn_logits.masked_fill(~valid_mask, -1e9)
+            attn_weights = F.softmax(attn_logits, dim=1)  # (B, L_i)
+            attn_weights = attn_weights * valid_mask.float()
+            weight_denom = attn_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            attn_weights = attn_weights / weight_denom
+            seq_pooled = torch.bmm(
+                attn_weights.unsqueeze(1),
+                seq_tokens,
+            ).squeeze(1)  # (B, D)
 
             # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)。
             global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
@@ -1626,6 +1681,8 @@ class PCVRHyFormer(nn.Module):
         self.query_generator = MultiSeqQueryGenerator(
             d_model=d_model,
             num_ns=self.num_ns,
+            num_item_ns=num_item_ns,
+            has_item_dense=self.has_item_dense,
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
@@ -1964,6 +2021,40 @@ class PCVRHyFormer(nn.Module):
 
         return torch.cat(ns_parts, dim=1)
 
+    def _build_time_context(self, inputs: ModelInput) -> torch.Tensor:
+        """构建点击时间的上下文向量，用于 time-conditioned DIN query。"""
+        if not self.use_seq_calendar_features:
+            return torch.zeros(
+                (inputs.user_int_feats.shape[0], self.d_model),
+                device=inputs.user_int_feats.device,
+            )
+
+        timestamps = inputs.timestamp.to(device=inputs.user_int_feats.device)
+        local_seconds = timestamps + LOCAL_TIME_OFFSET_SECONDS
+        days = local_seconds // 86400
+        seconds_in_day = local_seconds % 86400
+
+        hour = seconds_in_day // 3600
+        day_of_week = (days + 3) % 7
+
+        local_np = local_seconds.to(torch.int64).cpu().numpy()
+        months = local_np.astype('datetime64[s]').astype('datetime64[M]')
+        day_of_month = (
+            local_np.astype('datetime64[s]').astype('datetime64[D]')
+            - months.astype('datetime64[D]')
+        ).astype('int64')
+
+        hour_ids = hour.to(torch.int64) + 1
+        dow_ids = day_of_week.to(torch.int64) + 1
+        dom_ids = torch.from_numpy(day_of_month + 1).to(timestamps.device)
+
+        calendar_emb = (
+            self.seq_calendar_embeddings['hour_of_day'](hour_ids)
+            + self.seq_calendar_embeddings['day_of_week'](dow_ids)
+            + self.seq_calendar_embeddings['day_of_month'](dom_ids)
+        )
+        return calendar_emb
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """执行训练阶段 forward，返回 logits。"""
         # 1. 构造 NS token：user/item generic token、可选 tuple token、dense token。
@@ -1984,7 +2075,13 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. 每个序列域根据 NS token 和自身 summary 生成独立 Q token。
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        time_context = self._build_time_context(inputs)
+        q_tokens_list = self.query_generator(
+            ns_tokens,
+            seq_tokens_list,
+            seq_masks_list,
+            time_context=time_context,
+        )
 
         # 4. 多层 HyFormer block 中完成 query-sequence 交互和 Q/NS token 交叉。
         output = self._run_multi_seq_blocks(
@@ -2015,7 +2112,13 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        time_context = self._build_time_context(inputs)
+        q_tokens_list = self.query_generator(
+            ns_tokens,
+            seq_tokens_list,
+            seq_masks_list,
+            time_context=time_context,
+        )
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,

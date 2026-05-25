@@ -496,6 +496,7 @@ class PCVRHyFormerRankingTrainer:
             item_int_feats=device_batch['item_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
+            timestamp=device_batch['timestamp'],
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
