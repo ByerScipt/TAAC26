@@ -265,11 +265,6 @@ class PCVRParquetDataset(IterableDataset):
             ci = self._col_idx.get(f'item_int_feats_{fid}')
             self._item_int_plan.append((ci, dim, offset, vs))
             offset += dim
-        self._item_fid11_offset_length = (
-            self.item_int_schema.get_offset_length(11)
-            if 11 in self.item_int_schema.feature_ids
-            else None
-        )
 
         self._user_dense_plan = []
         offset = 0
@@ -558,16 +553,6 @@ class PCVRParquetDataset(IterableDataset):
                     padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
 
-        item_fid11_len = np.zeros(B, dtype=np.int64)
-        if self._item_fid11_offset_length is not None:
-            fid11_offset, fid11_width = self._item_fid11_offset_length
-            fid11_vals = item_int[:, fid11_offset:fid11_offset + fid11_width]
-            item_fid11_len[:] = np.clip(
-                np.count_nonzero(fid11_vals > 0, axis=1),
-                0,
-                20,
-            )
-
         # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]
         user_dense[:] = 0
@@ -580,7 +565,6 @@ class PCVRParquetDataset(IterableDataset):
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
-            'item_fid11_len': torch.from_numpy(item_fid11_len.copy()),
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),

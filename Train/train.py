@@ -135,6 +135,10 @@ def parse_args() -> argparse.Namespace:
                              'full = token mixing + per-token FFN (requires d_model divisible by T), '
                              'ffn_only = per-token FFN only, '
                              'none = identity passthrough')
+    parser.add_argument('--rank_mixer_moe_num_experts', type=int, default=4,
+                        help='Number of experts in RankMixer sparse MoE FFN')
+    parser.add_argument('--rank_mixer_moe_top_k', type=int, default=2,
+                        help='Top-k experts selected per token in RankMixer sparse MoE FFN')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -231,9 +235,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
-    parser.add_argument('--use_item_fid11_len_token', action='store_true', default=False,
-                        help='Add one standalone item-side NS token that encodes '
-                             'the visible non-zero length of item fid11 (bucketed as 0..20)')
 
     args = parser.parse_args()
 
@@ -344,6 +345,8 @@ def main() -> None:
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,
+        "rank_mixer_moe_num_experts": args.rank_mixer_moe_num_experts,
+        "rank_mixer_moe_top_k": args.rank_mixer_moe_top_k,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
@@ -351,7 +354,6 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
-        "use_item_fid11_len_token": args.use_item_fid11_len_token,
         "multi_scale_queries": args.multi_scale_queries,
         "q_dropout_mult": args.q_dropout_mult,
     }

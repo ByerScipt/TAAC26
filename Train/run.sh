@@ -17,6 +17,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --log_every_n_steps 200 \
     --num_workers 8 \
+    --rank_mixer_moe_num_experts 8 \
+    --rank_mixer_moe_top_k 2 \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

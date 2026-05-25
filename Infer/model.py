@@ -11,7 +11,6 @@ from typing import List, NamedTuple, Tuple, Optional, Union
 class ModelInput(NamedTuple):
     user_int_feats: torch.Tensor
     item_int_feats: torch.Tensor
-    item_fid11_len: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
@@ -334,7 +333,9 @@ class RankMixerBlock(nn.Module):
         n_total: int,  # T = Nq + Nns
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
+        mode: str = 'full',  # 'full' | 'ffn_only' | 'none'
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
     ) -> None:
         super().__init__()
         self.T = n_total
@@ -352,10 +353,28 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
+        if moe_num_experts <= 0:
+            raise ValueError(f"moe_num_experts must be positive, got {moe_num_experts}")
+        if moe_top_k <= 0:
+            raise ValueError(f"moe_top_k must be positive, got {moe_top_k}")
+        if moe_top_k > moe_num_experts:
+            raise ValueError(
+                f"moe_top_k ({moe_top_k}) cannot exceed moe_num_experts ({moe_num_experts})"
+            )
+
+        self.moe_num_experts = moe_num_experts
+        self.moe_top_k = moe_top_k
+
+        # Token-level sparse MoE FFN — used by both 'full' and 'ffn_only'
         self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
-        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
+        hidden_dim = d_model * hidden_mult
+        self.router = nn.Linear(d_model, moe_num_experts)
+        self.experts_fc1 = nn.ModuleList([
+            nn.Linear(d_model, hidden_dim) for _ in range(moe_num_experts)
+        ])
+        self.experts_fc2 = nn.ModuleList([
+            nn.Linear(hidden_dim, d_model) for _ in range(moe_num_experts)
+        ])
         self.dropout = nn.Dropout(dropout)
         # Post-LN after residual to stabilize stacked block outputs
         self.post_norm = nn.LayerNorm(d_model)
@@ -404,12 +423,33 @@ class RankMixerBlock(nn.Module):
         else:  # 'ffn_only'
             Q_hat = Q
 
-        # Per-token FFN
+        # Token-level sparse MoE FFN
         x = self.norm(Q_hat)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
-        Q_e = self.fc2(x)
+        B, T, D = x.shape
+        x_flat = x.reshape(B * T, D)
+
+        # Router per token: (B*T, E)
+        router_logits = self.router(x_flat)
+        topk_logits, topk_indices = torch.topk(router_logits, k=self.moe_top_k, dim=-1)
+        topk_gates = F.softmax(topk_logits, dim=-1).to(x_flat.dtype)
+
+        # Sparse dispatch: only selected expert paths are evaluated.
+        out_flat = torch.zeros_like(x_flat)
+        for expert_id in range(self.moe_num_experts):
+            token_pos, slot_pos = torch.where(topk_indices == expert_id)
+            if token_pos.numel() == 0:
+                continue
+
+            expert_in = x_flat.index_select(0, token_pos)
+            expert_out = self.experts_fc1[expert_id](expert_in)
+            expert_out = F.gelu(expert_out)
+            expert_out = self.dropout(expert_out)
+            expert_out = self.experts_fc2[expert_id](expert_out)
+
+            gates = topk_gates[token_pos, slot_pos].unsqueeze(-1)
+            out_flat.index_add_(0, token_pos, expert_out * gates)
+
+        Q_e = out_flat.view(B, T, D)
 
         # Residual from original Q
         Q_boost = Q + Q_e
@@ -908,6 +948,8 @@ class MultiSeqHyFormerBlock(nn.Module):
         causal: bool = False,
         rank_mixer_mode: str = 'full',
         multi_scale_queries: bool = False,
+        rank_mixer_moe_num_experts: int = 4,
+        rank_mixer_moe_top_k: int = 2,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -949,7 +991,9 @@ class MultiSeqHyFormerBlock(nn.Module):
             n_total=n_total,
             hidden_mult=hidden_mult,
             dropout=dropout,
-            mode=rank_mixer_mode
+            mode=rank_mixer_mode,
+            moe_num_experts=rank_mixer_moe_num_experts,
+            moe_top_k=rank_mixer_moe_top_k,
         )
 
     @staticmethod
@@ -1310,6 +1354,8 @@ class PCVRHyFormer(nn.Module):
         action_num: int = 1,
         num_time_buckets: int = 65,
         rank_mixer_mode: str = 'full',
+        rank_mixer_moe_num_experts: int = 4,
+        rank_mixer_moe_top_k: int = 2,
         use_rope: bool = False,
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
@@ -1318,7 +1364,6 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
-        use_item_fid11_len_token: bool = False,
         multi_scale_queries: bool = False,
         # query 侧可单独加大 dropout，降低对短期时间模式的依赖。
         q_dropout_mult: float = 1.0,
@@ -1339,7 +1384,6 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
-        self.use_item_fid11_len_token = use_item_fid11_len_token
 
         # ================== NS Tokens Construction ==================
 
@@ -1407,14 +1451,10 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(item_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
-        if self.use_item_fid11_len_token:
-            self.item_fid11_len_embedding = nn.Embedding(21, d_model)
-            self.item_fid11_len_norm = nn.LayerNorm(d_model)
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0)
-                       + (1 if self.use_item_fid11_len_token else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1531,6 +1571,8 @@ class PCVRHyFormer(nn.Module):
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
                 multi_scale_queries=multi_scale_queries,
+                rank_mixer_moe_num_experts=rank_mixer_moe_num_experts,
+                rank_mixer_moe_top_k=rank_mixer_moe_top_k,
             )
             for _ in range(num_hyformer_blocks)
         ])
@@ -1609,15 +1651,6 @@ class PCVRHyFormer(nn.Module):
         for emb in self.dom_embeddings:
             nn.init.xavier_normal_(emb.weight.data)
             emb.weight.data[0, :] = 0
-
-        if self.use_item_fid11_len_token:
-            nn.init.xavier_normal_(self.item_fid11_len_embedding.weight.data)
-
-    def _build_item_fid11_len_token(self, item_fid11_len: torch.Tensor) -> torch.Tensor:
-        """Encode the visible length of item fid11 as one standalone NS token."""
-        token = self.item_fid11_len_embedding(item_fid11_len.long())
-        token = F.silu(self.item_fid11_len_norm(token))
-        return token.unsqueeze(1)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1822,8 +1855,6 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
-        if self.use_item_fid11_len_token:
-            ns_parts.append(self._build_item_fid11_len_token(inputs.item_fid11_len))
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1872,8 +1903,6 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
-        if self.use_item_fid11_len_token:
-            ns_parts.append(self._build_item_fid11_len_token(inputs.item_fid11_len))
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 

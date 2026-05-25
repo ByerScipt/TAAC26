@@ -721,14 +721,6 @@ class PCVRHyFormerRankingTrainer:
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
-            item_fid11_len=device_batch.get(
-                'item_fid11_len',
-                torch.zeros(
-                    device_batch['user_int_feats'].shape[0],
-                    dtype=torch.long,
-                    device=self.device,
-                ),
-            ),
             user_dense_feats=device_batch['user_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
             seq_data=seq_data,

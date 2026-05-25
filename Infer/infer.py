@@ -62,6 +62,8 @@ _FALLBACK_MODEL_CFG = {
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
     'rank_mixer_mode': 'full',
+    'rank_mixer_moe_num_experts': 8,
+    'rank_mixer_moe_top_k': 2,
     'use_rope': False,
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
@@ -69,7 +71,6 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
-    'use_item_fid11_len_token': False,
     'multi_scale_queries': False,
     'q_dropout_mult': 1.0,
 }
@@ -351,14 +352,6 @@ def _batch_to_model_input(
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
-        item_fid11_len=device_batch.get(
-            'item_fid11_len',
-            torch.zeros(
-                device_batch['user_int_feats'].shape[0],
-                dtype=torch.long,
-                device=device,
-            ),
-        ),
         user_dense_feats=device_batch['user_dense_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
         seq_data=seq_data,
