@@ -22,11 +22,12 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS, ENGINEERED_DENSE_DIM
+from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
 from model import PCVRHyFormer, ModelInput
 
 
@@ -48,9 +49,9 @@ logging.basicConfig(
 # When the feature is enabled we therefore use the constant exposed by the
 # dataset module; ``0`` means disabled.
 _FALLBACK_MODEL_CFG = {
-    'd_model': 84,
+    'd_model': 64,
     'emb_dim': 64,
-    'num_queries': 3,
+    'num_queries': 1,
     'num_hyformer_blocks': 2,
     'num_heads': 4,
     'seq_encoder_type': 'transformer',
@@ -60,20 +61,17 @@ _FALLBACK_MODEL_CFG = {
     'seq_causal': False,
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
-    'use_seq_calendar_features': True,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
-    'emb_skip_threshold': 1000000,
+    'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
-    'user_ns_tokens': 5,
-    'item_ns_tokens': 2,
-    'use_engineered_dense_features': True,
-    'engineered_dense_dim': ENGINEERED_DENSE_DIM,
-    'use_shared_fid_tuple_token': True,
-    'shared_fids': [62, 63, 64, 65, 66],
-    'shared_fid_tuple_mode': 'replace',
+    'user_ns_tokens': 0,
+    'item_ns_tokens': 0,
+    'use_item_fid11_len_token': False,
+    'multi_scale_queries': False,
+    'q_dropout_mult': 1.0,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -97,50 +95,6 @@ def build_feature_specs(
     for fid, offset, length in schema.entries:
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
-    return specs
-
-
-def parse_shared_fids(value: Any) -> List[int]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [int(fid) for fid in value]
-    if isinstance(value, tuple):
-        return [int(fid) for fid in value]
-    return [int(fid.strip()) for fid in str(value).split(',') if fid.strip()]
-
-
-def build_shared_fid_tuple_specs(
-    user_int_schema: FeatureSchema,
-    user_int_vocab_sizes: List[int],
-    user_dense_schema: FeatureSchema,
-    shared_fids: List[int],
-) -> List[Dict[str, int]]:
-    user_fid_to_idx = {
-        fid: i for i, (fid, _, _) in enumerate(user_int_schema.entries)
-    }
-    specs: List[Dict[str, int]] = []
-    for fid in shared_fids:
-        if not user_int_schema.has_feature(fid):
-            raise KeyError(f"shared fid {fid} not found in user_int schema")
-        if not user_dense_schema.has_feature(fid):
-            raise KeyError(f"shared fid {fid} not found in user_dense schema")
-        int_offset, int_length = user_int_schema.get_offset_length(fid)
-        dense_offset, dense_length = user_dense_schema.get_offset_length(fid)
-        if int_length != dense_length:
-            raise ValueError(
-                f"shared fid {fid} int_length={int_length} != dense_length={dense_length}"
-            )
-        int_vocab_size = max(user_int_vocab_sizes[int_offset:int_offset + int_length])
-        specs.append({
-            "fid": fid,
-            "int_feature_idx": user_fid_to_idx[fid],
-            "int_offset": int_offset,
-            "int_length": int_length,
-            "int_vocab_size": int_vocab_size,
-            "dense_offset": dense_offset,
-            "dense_length": dense_length,
-        })
     return specs
 
 
@@ -269,28 +223,6 @@ def build_model(
         dataset.user_int_schema, dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
-    shared_fids = parse_shared_fids(model_cfg.get('shared_fids', []))
-    model_cfg = dict(model_cfg)
-    model_cfg['shared_fids'] = shared_fids
-    shared_fid_tuple_specs: List[Dict[str, int]] = []
-    if model_cfg.get('use_shared_fid_tuple_token', False):
-        shared_fid_tuple_specs = build_shared_fid_tuple_specs(
-            dataset.user_int_schema,
-            dataset.user_int_vocab_sizes,
-            dataset.user_dense_schema,
-            shared_fids,
-        )
-        logging.info(f"use_shared_fid_tuple_token={model_cfg['use_shared_fid_tuple_token']}")
-        logging.info(f"shared_fids={shared_fids}")
-        logging.info(f"shared_fid_tuple_mode={model_cfg.get('shared_fid_tuple_mode')}")
-        for spec in shared_fid_tuple_specs:
-            logging.info(
-                "shared_fid_tuple spec: "
-                f"fid={spec['fid']} "
-                f"int_offset={spec['int_offset']} int_length={spec['int_length']} "
-                f"dense_offset={spec['dense_offset']} dense_length={spec['dense_length']}"
-            )
-    logging.info(f"tuple token count={1 if model_cfg.get('use_shared_fid_tuple_token', False) else 0}")
 
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
@@ -301,13 +233,8 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
-        shared_fid_tuple_specs=shared_fid_tuple_specs,
         **model_cfg,
     ).to(device)
-
-    num_sequences = len(dataset.seq_domains)
-    total_tokens = int(model_cfg['num_queries']) * num_sequences + model.num_ns
-    logging.info(f"final num_ns={model.num_ns}, total token count T={total_tokens}")
 
     return model
 
@@ -319,16 +246,68 @@ def load_model_state_strict(
 ) -> None:
     """Strictly load ``state_dict``; any missing/unexpected key fails fast
     with a diagnostic message.
+
+    Automatically strips ``_orig_mod.`` prefix from checkpoint keys, so that
+    checkpoints saved by a torch.compile()-wrapped training script can be
+    loaded into an uncompiled inference model.
     """
     state_dict = torch.load(ckpt_path, map_location=device)
+
+    # Strip '_orig_mod.' prefix: torch.compile() wraps the model in an
+    # _orig_mod container whose state_dict keys all have this prefix.
+    # Training saves the uncompiled state_dict, but as a safety net we
+    # handle the prefix here transparently.
+    orig_mod_prefix = '_orig_mod.'
+    if any(k.startswith(orig_mod_prefix) for k in state_dict.keys()):
+        logging.info(
+            f"Stripping '{orig_mod_prefix}' prefix from {sum(1 for k in state_dict if k.startswith(orig_mod_prefix))} "
+            f"checkpoint keys (torch.compile() _orig_mod container detected)"
+        )
+        state_dict = {
+            (k[len(orig_mod_prefix):] if k.startswith(orig_mod_prefix) else k): v
+            for k, v in state_dict.items()
+        }
+
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
-        logging.error(
-            "Failed to load state_dict in strict mode. This usually means the "
-            "model constructed by build_model does NOT match the checkpoint. "
+        expected = set(model.state_dict().keys())
+        found = set(state_dict.keys())
+        missing = expected - found
+        unexpected = found - expected
+
+        diag_parts = [
+            "Failed to load state_dict in strict mode.",
+            "This usually means the model constructed by build_model does NOT "
+            "match the checkpoint.",
             "Check that train_config.json in the ckpt dir is present and matches "
-            "the training hyperparameters.")
+            "the training hyperparameters.",
+        ]
+
+        if missing:
+            # Group by module prefix for readability
+            from collections import defaultdict
+            by_prefix = defaultdict(list)
+            for k in sorted(missing):
+                prefix = k.split('.')[0]
+                by_prefix[prefix].append(k)
+            diag_parts.append(f"--- Missing keys ({len(missing)}) ---")
+            for prefix, keys in sorted(by_prefix.items()):
+                if len(keys) <= 3:
+                    diag_parts.extend(f"  {prefix}: {keys}")
+                else:
+                    diag_parts.append(f"  {prefix}: {len(keys)} keys (e.g. {keys[0]}, {keys[1]}, ...)")
+
+        if unexpected:
+            diag_parts.append(f"--- Unexpected keys ({len(unexpected)}) ---")
+            for i, k in enumerate(sorted(unexpected)):
+                if i < 5:
+                    diag_parts.append(f"  {k}")
+            if len(unexpected) > 5:
+                diag_parts.append(f"  ... and {len(unexpected) - 5} more")
+
+        for line in diag_parts:
+            logging.error(line)
         raise e
 
 
@@ -361,7 +340,6 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
-    seq_calendar_feats: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -369,22 +347,239 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
-        seq_calendar_feats[domain] = device_batch.get(
-            f'{domain}_calendar_feats',
-            torch.zeros(B, 3, L, dtype=torch.long, device=device))
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
+        item_fid11_len=device_batch.get(
+            'item_fid11_len',
+            torch.zeros(
+                device_batch['user_int_feats'].shape[0],
+                dtype=torch.long,
+                device=device,
+            ),
+        ),
         user_dense_feats=device_batch['user_dense_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
-        timestamp=device_batch['timestamp'],
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
-        seq_calendar_feats=seq_calendar_feats,
-        engineered_dense_feats=device_batch.get('engineered_dense_feats'),
+        hour=device_batch.get('hour', torch.zeros(device_batch['user_int_feats'].shape[0], dtype=torch.long, device=device)),
+        day_of_week=device_batch.get('day_of_week', torch.zeros(device_batch['user_int_feats'].shape[0], dtype=torch.long, device=device)),
+        day_of_month=device_batch.get('day_of_month', torch.zeros(device_batch['user_int_feats'].shape[0], dtype=torch.long, device=device)),
     )
+
+
+def _normalized_histogram(
+    values: np.ndarray,
+    start: int,
+    end: int,
+) -> Dict[str, float]:
+    """Return normalized mass over a small integer bucket range."""
+    if values.size == 0:
+        return {}
+    total = float(values.size)
+    hist: Dict[str, float] = {}
+    for v in range(start, end + 1):
+        count = int(np.sum(values == v))
+        if count > 0:
+            hist[str(v)] = count / total
+    return hist
+
+
+def _top_hist_text(hist: Dict[str, float], top_k: int = 4) -> str:
+    """Format top normalized buckets for readable logs."""
+    if not hist:
+        return "n/a"
+    items = sorted(hist.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+    return " ".join(f"{k}:{v * 100:.1f}%" for k, v in items)
+
+
+def _summarize_infer_monitor(
+    probs_np: np.ndarray,
+    all_hour_list: List[np.ndarray],
+    all_dow_list: List[np.ndarray],
+    all_dom_list: List[np.ndarray],
+    seq_domains: List[str],
+    all_seq_lens: Dict[str, List[np.ndarray]],
+) -> Dict[str, Any]:
+    """Build a compact test-side monitor for shift inspection."""
+    hours_np = np.concatenate(all_hour_list) if all_hour_list else np.array([], dtype=np.int64)
+    dow_np = np.concatenate(all_dow_list) if all_dow_list else np.array([], dtype=np.int64)
+    dom_np = np.concatenate(all_dom_list) if all_dom_list else np.array([], dtype=np.int64)
+
+    monitor: Dict[str, Any] = {
+        'n_samples': int(len(probs_np)),
+        'score': {
+            'mean': float(np.mean(probs_np)),
+            'std': float(np.std(probs_np)),
+            'q05': float(np.percentile(probs_np, 5)),
+            'q25': float(np.percentile(probs_np, 25)),
+            'q50': float(np.percentile(probs_np, 50)),
+            'q75': float(np.percentile(probs_np, 75)),
+            'q95': float(np.percentile(probs_np, 95)),
+        },
+        'calendar': {
+            'hour_share': _normalized_histogram(hours_np, 1, 24),
+            'weekday_share': _normalized_histogram(dow_np, 1, 7),
+            'monthday_share': _normalized_histogram(dom_np, 1, 31),
+        },
+        'score_by_hour': {},
+        'seq_profile': {},
+    }
+    score_by_hour: Dict[str, Dict[str, float]] = {}
+    for hour in range(1, 25):
+        mask = hours_np == hour
+        if int(mask.sum()) == 0:
+            continue
+        score_by_hour[str(hour)] = {
+            'mean': float(np.mean(probs_np[mask])),
+            'std': float(np.std(probs_np[mask])),
+            'share': float(np.mean(mask)),
+        }
+    monitor['score_by_hour'] = score_by_hour
+    seq_profile: Dict[str, Dict[str, float]] = {}
+    for domain in seq_domains:
+        if domain not in all_seq_lens or not all_seq_lens[domain]:
+            continue
+        lens_np = np.concatenate(all_seq_lens[domain]).astype(np.int64)
+        seq_profile[domain] = {
+            'mean_len': float(np.mean(lens_np)),
+            'p50_len': float(np.percentile(lens_np, 50)),
+            'p90_len': float(np.percentile(lens_np, 90)),
+            'zero_ratio': float(np.mean(lens_np == 0)),
+        }
+    monitor['seq_profile'] = seq_profile
+    return monitor
+
+
+def _log_infer_monitor(monitor: Dict[str, Any]) -> None:
+    """Print a compact summary of inference-side data and score shape."""
+    score = monitor.get('score', {})
+    calendar = monitor.get('calendar', {})
+    seq_profile = monitor.get('seq_profile', {})
+
+    logging.info(
+        "Monitor(test) score mean=%.6f std=%.6f q50=%.6f q95=%.6f n=%d",
+        float(score.get('mean', 0.0)),
+        float(score.get('std', 0.0)),
+        float(score.get('q50', 0.0)),
+        float(score.get('q95', 0.0)),
+        int(monitor.get('n_samples', 0)),
+    )
+    logging.info(
+        "Monitor(test) calendar hour_top=%s | weekday_top=%s | monthday_top=%s",
+        _top_hist_text(calendar.get('hour_share', {})),
+        _top_hist_text(calendar.get('weekday_share', {}), top_k=3),
+        _top_hist_text(calendar.get('monthday_share', {}), top_k=3),
+    )
+    if seq_profile:
+        seq_parts = []
+        for domain in sorted(seq_profile.keys()):
+            stats = seq_profile[domain]
+            seq_parts.append(
+                f"{domain}[mean={stats['mean_len']:.1f},p90={stats['p90_len']:.1f},zero={stats['zero_ratio'] * 100:.1f}%]"
+            )
+        logging.info("Monitor(test) seq %s", " | ".join(seq_parts))
+
+
+def _tv_distance(lhs: Dict[str, float], rhs: Dict[str, float]) -> float:
+    """Total variation distance between two sparse histograms."""
+    keys = set(lhs.keys()) | set(rhs.keys())
+    if not keys:
+        return 0.0
+    return 0.5 * sum(abs(lhs.get(k, 0.0) - rhs.get(k, 0.0)) for k in keys)
+
+
+def _log_shift_watch(
+    model_dir: str,
+    test_monitor: Dict[str, Any],
+) -> None:
+    """Compare current test-side monitor against saved validation monitor."""
+    candidates = [
+        os.path.join(model_dir, 'eval_monitor.json'),
+        os.path.join(os.path.dirname(model_dir.rstrip('/')), 'eval_monitor.json'),
+    ]
+    valid_monitor = None
+    matched_path = None
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            with open(candidate, 'r') as f:
+                valid_monitor = json.load(f)
+            matched_path = candidate
+            break
+
+    if valid_monitor is None:
+        logging.info("ShiftWatch skipped: eval_monitor.json not found in %s", candidates)
+        return
+
+    v_score = valid_monitor.get('score', {})
+    t_score = test_monitor.get('score', {})
+    logging.info(
+        "ShiftWatch source=%s mean_gap=%+.6f std_ratio=%.4f q50_gap=%+.6f q95_gap=%+.6f",
+        matched_path,
+        float(t_score.get('mean', 0.0)) - float(v_score.get('mean', 0.0)),
+        float(t_score.get('std', 0.0)) / max(float(v_score.get('std', 0.0)), 1e-8),
+        float(t_score.get('q50', 0.0)) - float(v_score.get('q50', 0.0)),
+        float(t_score.get('q95', 0.0)) - float(v_score.get('q95', 0.0)),
+    )
+    logging.info(
+        "ShiftWatch quantile_gap q05=%+.6f q25=%+.6f q75=%+.6f q95=%+.6f iqr_ratio=%.4f",
+        float(t_score.get('q05', 0.0)) - float(v_score.get('q05', 0.0)),
+        float(t_score.get('q25', 0.0)) - float(v_score.get('q25', 0.0)),
+        float(t_score.get('q75', 0.0)) - float(v_score.get('q75', 0.0)),
+        float(t_score.get('q95', 0.0)) - float(v_score.get('q95', 0.0)),
+        (
+            (float(t_score.get('q75', 0.0)) - float(t_score.get('q25', 0.0)))
+            / max(float(v_score.get('q75', 0.0)) - float(v_score.get('q25', 0.0)), 1e-8)
+        ),
+    )
+
+    v_calendar = valid_monitor.get('calendar', {})
+    t_calendar = test_monitor.get('calendar', {})
+    logging.info(
+        "ShiftWatch calendar hour_tv=%.4f weekday_tv=%.4f monthday_tv=%.4f",
+        _tv_distance(v_calendar.get('hour_share', {}), t_calendar.get('hour_share', {})),
+        _tv_distance(v_calendar.get('weekday_share', {}), t_calendar.get('weekday_share', {})),
+        _tv_distance(v_calendar.get('monthday_share', {}), t_calendar.get('monthday_share', {})),
+    )
+    logging.info(
+        "ShiftWatch calendar_top valid_hour=%s | test_hour=%s | valid_weekday=%s | test_weekday=%s",
+        _top_hist_text(v_calendar.get('hour_share', {})),
+        _top_hist_text(t_calendar.get('hour_share', {})),
+        _top_hist_text(v_calendar.get('weekday_share', {}), top_k=3),
+        _top_hist_text(t_calendar.get('weekday_share', {}), top_k=3),
+    )
+
+    v_seq = valid_monitor.get('seq_profile', {})
+    t_seq = test_monitor.get('seq_profile', {})
+    seq_parts = []
+    for domain in sorted(set(v_seq.keys()) & set(t_seq.keys())):
+        v_stats = v_seq[domain]
+        t_stats = t_seq[domain]
+        seq_parts.append(
+            f"{domain}[mean_gap={t_stats['mean_len'] - v_stats['mean_len']:+.2f},"
+            f"p90_gap={t_stats['p90_len'] - v_stats['p90_len']:+.2f},"
+            f"zero_gap={(t_stats['zero_ratio'] - v_stats['zero_ratio']) * 100:+.2f}%]"
+        )
+    if seq_parts:
+        logging.info("ShiftWatch seq %s", " | ".join(seq_parts))
+
+    v_hour_score = valid_monitor.get('score_by_hour', {})
+    t_hour_score = test_monitor.get('score_by_hour', {})
+    hour_gaps = []
+    for hour in sorted(set(v_hour_score.keys()) & set(t_hour_score.keys()), key=int):
+        mean_gap = float(t_hour_score[hour]['mean']) - float(v_hour_score[hour]['mean'])
+        std_ratio = float(t_hour_score[hour]['std']) / max(float(v_hour_score[hour]['std']), 1e-8)
+        hour_gaps.append((abs(mean_gap), hour, mean_gap, std_ratio, float(t_hour_score[hour]['share'])))
+    if hour_gaps:
+        hour_gaps.sort(reverse=True)
+        parts = []
+        for _, hour, mean_gap, std_ratio, share in hour_gaps[:6]:
+            parts.append(
+                f"h{hour}[gap={mean_gap:+.4f},stdx={std_ratio:.3f},share={share * 100:.1f}%]"
+            )
+        logging.info("ShiftWatch hour_score %s", " | ".join(parts))
 
 
 def main() -> None:
@@ -424,7 +619,6 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
-        return_user_id=True,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
@@ -476,6 +670,11 @@ def main() -> None:
 
     all_probs = []
     all_user_ids = []
+    all_hour_list: List[np.ndarray] = []
+    all_dow_list: List[np.ndarray] = []
+    all_dom_list: List[np.ndarray] = []
+    seq_domains: List[str] = []
+    all_seq_lens: Dict[str, List[np.ndarray]] = {}
     logging.info("Starting inference...")
 
     with torch.no_grad():
@@ -489,10 +688,41 @@ def main() -> None:
             all_probs.extend(probs.tolist())
             all_user_ids.extend(user_ids)
 
+            if 'hour' in batch:
+                all_hour_list.append(batch['hour'].detach().cpu().numpy())
+            if 'day_of_week' in batch:
+                all_dow_list.append(batch['day_of_week'].detach().cpu().numpy())
+            if 'day_of_month' in batch:
+                all_dom_list.append(batch['day_of_month'].detach().cpu().numpy())
+            if not seq_domains:
+                seq_domains = list(batch['_seq_domains'])
+                for domain in seq_domains:
+                    all_seq_lens[domain] = []
+            for domain in seq_domains:
+                all_seq_lens[domain].append(
+                    batch[f'{domain}_len'].detach().cpu().numpy()
+                )
+
             if (batch_idx + 1) % 100 == 0:
-                logging.info(f"  Processed {(batch_idx + 1) * batch_size} samples")
+                logging.info(
+                    f"Inference progress: batch={batch_idx + 1}, "
+                    f"predictions={len(all_probs)}"
+                )
 
     logging.info(f"Inference complete: {len(all_probs)} predictions")
+
+    probs_np = np.asarray(all_probs, dtype=np.float64)
+    if probs_np.size > 0:
+        test_monitor = _summarize_infer_monitor(
+            probs_np=probs_np,
+            all_hour_list=all_hour_list,
+            all_dow_list=all_dow_list,
+            all_dom_list=all_dom_list,
+            seq_domains=seq_domains,
+            all_seq_lens=all_seq_lens,
+        )
+        _log_infer_monitor(test_monitor)
+        _log_shift_watch(model_dir, test_monitor)
 
     predictions = {
         "predictions": dict(zip(all_user_ids, all_probs)),

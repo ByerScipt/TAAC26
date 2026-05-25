@@ -1,15 +1,12 @@
-"""PCVRHyFormer 的训练入口。
+"""PCVRHyFormer training entry point (self-contained baseline).
 
-用法：
+Usage:
     python train.py [--num_epochs 10] [--batch_size 256] ...
 
-线上训练平台会通过环境变量注入数据、checkpoint 和日志路径；本地调试时也可以用
-命令行参数覆盖默认值。
-
-常用环境变量：
-    TRAIN_DATA_PATH  训练数据目录（*.parquet + schema.json）
-    TRAIN_CKPT_PATH  checkpoint 输出目录
-    TRAIN_LOG_PATH   日志目录
+Environment variables (take precedence over CLI flags):
+    TRAIN_DATA_PATH  Training data directory (*.parquet + schema.json)
+    TRAIN_CKPT_PATH  Checkpoint output directory
+    TRAIN_LOG_PATH   Log directory
 """
 
 import os
@@ -17,18 +14,12 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import List, Tuple
 
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import (
-    FeatureSchema,
-    get_pcvr_data,
-    NUM_TIME_BUCKETS,
-    ENGINEERED_DENSE_DIM,
-    ENGINEERED_DENSE_FEATURE_NAMES,
-)
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -37,11 +28,8 @@ def build_feature_specs(
     schema: FeatureSchema,
     per_position_vocab_sizes: List[int],
 ) -> List[Tuple[int, int, int]]:
-    """把 ``FeatureSchema`` 转成模型侧使用的离散特征规格。
-
-    dataset.py 会把同一组离散特征铺平成一个二维张量。这里记录每个 feature 在
-    这个扁平张量里的 ``offset``、``length`` 和词表大小，NS tokenizer 后续按这些
-    信息切片、查 Embedding、做多值 pooling。
+    """Build feature_specs of the form ``[(vocab_size, offset, length), ...]``
+    ordered by the positions recorded in ``schema.entries``.
     """
     specs: List[Tuple[int, int, int]] = []
     for fid, offset, length in schema.entries:
@@ -50,54 +38,10 @@ def build_feature_specs(
     return specs
 
 
-def parse_shared_fids(value: Any) -> List[int]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [int(fid) for fid in value]
-    if isinstance(value, tuple):
-        return [int(fid) for fid in value]
-    return [int(fid.strip()) for fid in str(value).split(',') if fid.strip()]
-
-
-def build_shared_fid_tuple_specs(
-    user_int_schema: FeatureSchema,
-    user_int_vocab_sizes: List[int],
-    user_dense_schema: FeatureSchema,
-    shared_fids: List[int],
-) -> List[Dict[str, int]]:
-    user_fid_to_idx = {
-        fid: i for i, (fid, _, _) in enumerate(user_int_schema.entries)
-    }
-    specs: List[Dict[str, int]] = []
-    for fid in shared_fids:
-        if not user_int_schema.has_feature(fid):
-            raise KeyError(f"shared fid {fid} not found in user_int schema")
-        if not user_dense_schema.has_feature(fid):
-            raise KeyError(f"shared fid {fid} not found in user_dense schema")
-        int_offset, int_length = user_int_schema.get_offset_length(fid)
-        dense_offset, dense_length = user_dense_schema.get_offset_length(fid)
-        if int_length != dense_length:
-            raise ValueError(
-                f"shared fid {fid} int_length={int_length} != dense_length={dense_length}"
-            )
-        int_vocab_size = max(user_int_vocab_sizes[int_offset:int_offset + int_length])
-        specs.append({
-            "fid": fid,
-            "int_feature_idx": user_fid_to_idx[fid],
-            "int_offset": int_offset,
-            "int_length": int_length,
-            "int_vocab_size": int_vocab_size,
-            "dense_offset": dense_offset,
-            "dense_length": dense_length,
-        })
-    return specs
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
-    # 路径参数；线上平台通常通过环境变量传入这些路径。
+    # Paths (environment variables take precedence).
     parser.add_argument('--data_dir', type=str, default=None,
                         help='Training data directory (env: TRAIN_DATA_PATH)')
     parser.add_argument('--schema_path', type=str, default=None,
@@ -107,55 +51,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--log_dir', type=str, default=None,
                         help='Log directory (env: TRAIN_LOG_PATH)')
 
-    # 训练循环相关参数。
+    # Training hyperparameters.
     parser.add_argument('--batch_size', type=int, default=256,
                         help='Batch size for both training and validation')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate for dense parameters (AdamW)')
-    parser.add_argument('--num_epochs', type=int, default=999,
+    parser.add_argument('--num_epochs', type=int, default=7,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
-    parser.add_argument('--patience', type=int, default=5,
+    parser.add_argument('--patience', type=int, default=3,
                         help='Early-stopping patience '
                              '(number of validations without improvement)')
+    parser.add_argument('--keep_top_k_best_models', type=int, default=2,
+                        help='How many `*.best_model` checkpoints to retain on disk by '
+                             'validation AUC rank (default 2 keeps the top two scores)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
 
-    # DataLoader 和 Row Group 划分相关参数。
+    # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
                         help='Number of DataLoader workers')
-    parser.add_argument('--valid_num_workers', type=int, default=-1,
-                        help='Number of validation DataLoader workers '
-                             '(-1 = reuse --num_workers)')
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
-    parser.add_argument('--log_every_n_steps', type=int, default=50,
-                        help='Write train loss / tqdm postfix and print profiling every N steps')
-    parser.add_argument('--max_train_steps', type=int, default=0,
-                        help='Profiling-only step cap; 0 means no limit')
-    parser.add_argument(
-        "--amp_dtype",
-        type=str,
-        default="none",
-        choices=["none", "bf16"],
-        help="AMP dtype for autocast speed probe. none disables AMP; bf16 enables torch.autocast with bfloat16.",
-    )
+    parser.add_argument('--log_every_n_steps', type=int, default=0,
+                        help='Log training loss every N steps '
+                             '(0 = only tqdm progress bar)')
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
 
-    # 主模型结构参数。
+    # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
                         help='Backbone hidden dimension (output size of each block)')
     parser.add_argument('--emb_dim', type=int, default=64,
@@ -193,11 +129,6 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
-    parser.add_argument('--use_seq_calendar_features', action='store_true', default=True,
-                        help='Enable event-level calendar embeddings for sequence timestamps')
-    parser.add_argument('--no_seq_calendar_features', dest='use_seq_calendar_features',
-                        action='store_false',
-                        help='Disable event-level sequence calendar embeddings')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -208,8 +139,10 @@ def parse_args() -> argparse.Namespace:
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
                         help='RoPE base frequency (default 10000)')
+    parser.add_argument('--multi_scale_queries', action='store_true', default=False,
+                        help='Use three recent-history horizons for query generation')
 
-    # 损失函数参数。
+    # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
@@ -219,7 +152,7 @@ def parse_args() -> argparse.Namespace:
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
 
-    # Embedding 使用独立的稀疏优化器。
+    # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
                         help='Learning rate for sparse parameters (Adagrad over Embeddings)')
     parser.add_argument('--sparse_weight_decay', type=float, default=0.0,
@@ -235,7 +168,7 @@ def parse_args() -> argparse.Namespace:
                              'Embeddings whose vocab_size exceeds this value are reset '
                              'at each epoch end (0 = never reset any Embedding)')
 
-    # 控制哪些特征创建 Embedding，以及序列 ID 特征的额外 dropout。
+    # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
                         help='At model construction time, features whose vocab_size '
                              'exceeds this value get no Embedding and are represented '
@@ -248,12 +181,36 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
-    parser.add_argument('--use_engineered_dense_features', action='store_true', default=True,
-                        help='Enable explicit recency + raw sequence length dense features')
-    parser.add_argument('--no_engineered_dense_features',
-                        dest='use_engineered_dense_features',
-                        action='store_false',
-                        help='Disable explicit engineered dense features')
+
+    # Training acceleration.
+    parser.add_argument('--grad_accumulation_steps', type=int, default=1,
+                        help='Number of micro-batches to accumulate before optimizer step '
+                             '(simulates larger batch size without extra GPU memory)')
+    parser.add_argument('--use_amp', dest='use_amp', action='store_true', default=True,
+                        help='Enable Automatic Mixed Precision (bf16/fp16) for training '
+                             '(default on)')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                        help='Disable Automatic Mixed Precision')
+    parser.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
+                        help='AMP dtype: bf16 or fp16 (default bf16; bf16 is preferred '
+                             'on Ampere+ GPUs for wider dynamic range)')
+    parser.add_argument('--compile_model', action='store_true', default=False,
+                        help='Enable torch.compile() JIT acceleration (mode=default). '
+                             'First slow batch compiles, subsequent batches are faster.')
+
+    # Temporal robustness.
+    parser.add_argument('--use_ema', action='store_true', default=False,
+                        help='Enable EMA of model weights '
+                             'for validation and checkpointing; smooths out temporal '
+                             'noise in gradients and improves test-set generalisation')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='EMA decay rate (default 0.999). Lower values (e.g. 0.99) '
+                             'give more weight to recent updates')
+    parser.add_argument('--q_dropout_mult', type=float, default=1.0,
+                        help='Multiplier on base dropout_rate for Q tokens '
+                             '(default 1.0 = same as NS/seq tokens). '
+                             'Values >1.0 (e.g. 3.0) make the model rely less on '
+                             'time-sensitive sequence signals')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -261,7 +218,7 @@ def parse_args() -> argparse.Namespace:
                         help='Path to the NS-groups JSON file. If it does not exist, '
                              'each feature is placed in its own singleton group.')
 
-    # NS token 的构造方式。
+    # NS tokenizer variant.
     parser.add_argument('--ns_tokenizer_type', type=str, default='rankmixer',
                         choices=['group', 'rankmixer'],
                         help='NS tokenizer variant: '
@@ -274,18 +231,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
-    parser.add_argument('--use_shared_fid_tuple_token', action='store_true', default=False,
-                        help='Enable schema-aware shared user fid int+dense tuple token')
-    parser.add_argument('--shared_fids', type=str, default='62,63,64,65,66',
-                        help='Comma-separated shared user fids for tuple tokenization')
-    parser.add_argument('--shared_fid_tuple_mode', type=str, default='replace',
-                        choices=['replace', 'additive'],
-                        help='replace excludes shared fids from generic user tokens; '
-                             'additive keeps them and adds the tuple token')
+    parser.add_argument('--use_item_fid11_len_token', action='store_true', default=False,
+                        help='Add one standalone item-side NS token that encodes '
+                             'the visible non-zero length of item fid11 (bucketed as 0..20)')
 
     args = parser.parse_args()
 
-    # 线上平台注入的环境变量优先于命令行参数。
+    # Environment variables take precedence.
     args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
     args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
     args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
@@ -296,35 +248,30 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    args.shared_fids = parse_shared_fids(args.shared_fids)
 
-    # checkpoint、日志和 TensorBoard 输出目录。
+    # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.tf_events_dir).mkdir(parents=True, exist_ok=True)
 
-    # 固定随机种子并初始化日志。
+    # Initialize logger and RNG.
     set_seed(args.seed)
+    # cuDNN autotuner: selects fastest kernels for the current input shapes
+    # at the cost of slightly higher warm-up overhead per shape. Desirable
+    # for fixed-shape training like PCVRHyFormer.
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
     create_logger(os.path.join(args.log_dir, 'train.log'))
+    if args.multi_scale_queries and args.num_queries != 3:
+        logging.info("--multi_scale_queries enabled: forcing num_queries=3")
+        args.num_queries = 3
     logging.info(f"Args: {vars(args)}")
-    logging.info("Experiment: exp_006_seq_calendar_time_no_month")
-    logging.info(f"use_engineered_dense_features={args.use_engineered_dense_features}")
-    logging.info(f"engineered_dense_dim={ENGINEERED_DENSE_DIM}")
-    logging.info(f"engineered feature names={ENGINEERED_DENSE_FEATURE_NAMES}")
-    logging.info(f"use_seq_calendar_features={args.use_seq_calendar_features}")
-    logging.info(f"amp_dtype={args.amp_dtype}")
-    logging.info(f"use_shared_fid_tuple_token={args.use_shared_fid_tuple_token}")
-    logging.info(f"shared_fids={args.shared_fids}")
-    logging.info(f"shared_fid_tuple_mode={args.shared_fid_tuple_mode}")
-    logging.info(
-        "original_shared_fids_still_in_generic_tokens="
-        f"{args.use_shared_fid_tuple_token and args.shared_fid_tuple_mode == 'additive'}"
-    )
 
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(args.tf_events_dir)
 
-    # ---- 数据加载：parquet/schema -> batch tensor ----
+    # ---- Data loading ----
     if args.schema_path:
         schema_path = args.schema_path
     else:
@@ -333,7 +280,7 @@ def main() -> None:
     if not os.path.exists(schema_path):
         raise FileNotFoundError(f"schema file not found at {schema_path}")
 
-    # 解析 seq_a/seq_b/seq_c/seq_d 的最大截断长度。
+    # Parse per-domain sequence-length overrides.
     seq_max_lens = {}
     if args.seq_max_lens:
         for pair in args.seq_max_lens.split(','):
@@ -349,13 +296,12 @@ def main() -> None:
         valid_ratio=args.valid_ratio,
         train_ratio=args.train_ratio,
         num_workers=args.num_workers,
-        valid_num_workers=args.valid_num_workers,
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
     )
 
-    # ---- NS 分组：决定离散 user/item 特征进入 token 的顺序和组合 ----
+    # ---- NS groups ----
     if args.ns_groups_json and os.path.exists(args.ns_groups_json):
         logging.info(f"Loading NS groups from {args.ns_groups_json}")
         with open(args.ns_groups_json, 'r') as f:
@@ -371,27 +317,11 @@ def main() -> None:
         user_ns_groups = [[i] for i in range(len(pcvr_dataset.user_int_schema.entries))]
         item_ns_groups = [[i] for i in range(len(pcvr_dataset.item_int_schema.entries))]
 
-    # ---- 构建模型：把 schema、tokenizer 配置和 backbone 参数传入 model.py ----
+    # ---- Build model ----
     user_int_feature_specs = build_feature_specs(
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
-    shared_fid_tuple_specs: List[Dict[str, int]] = []
-    if args.use_shared_fid_tuple_token:
-        shared_fid_tuple_specs = build_shared_fid_tuple_specs(
-            pcvr_dataset.user_int_schema,
-            pcvr_dataset.user_int_vocab_sizes,
-            pcvr_dataset.user_dense_schema,
-            args.shared_fids,
-        )
-        for spec in shared_fid_tuple_specs:
-            logging.info(
-                "shared_fid_tuple spec: "
-                f"fid={spec['fid']} "
-                f"int_offset={spec['int_offset']} int_length={spec['int_length']} "
-                f"dense_offset={spec['dense_offset']} dense_length={spec['dense_length']}"
-            )
-    logging.info(f"tuple token count={1 if args.use_shared_fid_tuple_token else 0}")
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
@@ -413,7 +343,6 @@ def main() -> None:
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
-        "use_seq_calendar_features": args.use_seq_calendar_features,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -422,33 +351,35 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
-        "use_engineered_dense_features": args.use_engineered_dense_features,
-        "engineered_dense_dim": ENGINEERED_DENSE_DIM,
-        "use_shared_fid_tuple_token": args.use_shared_fid_tuple_token,
-        "shared_fids": args.shared_fids,
-        "shared_fid_tuple_mode": args.shared_fid_tuple_mode,
-        "shared_fid_tuple_specs": shared_fid_tuple_specs,
+        "use_item_fid11_len_token": args.use_item_fid11_len_token,
+        "multi_scale_queries": args.multi_scale_queries,
+        "q_dropout_mult": args.q_dropout_mult,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
-    if args.use_engineered_dense_features:
-        logging.info(
-            "engineered_alpha initial value="
-            f"{float(model.engineered_alpha.detach().cpu().item()):.1f}"
-        )
+    model_for_log = model
 
-    # 记录 token 数、参数量和 RankMixer 的 T 值，便于排查维度约束。
+    # 编译只包住训练执行图；日志仍读取未包装模型，避免属性访问被封装层遮住。
+    if args.compile_model:
+        logging.info("Applying torch.compile(model, mode='default') ...")
+        model = torch.compile(model, mode='default')
+        logging.info("torch.compile() applied successfully")
+
+    # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
-    num_ns = model.num_ns
-    T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
-    logging.info(f"final num_ns={num_ns}, total token count T={T}")
+    num_ns = model_for_log.num_ns
+    T = model_for_log.num_queries * num_sequences + num_ns
+    logging.info(
+        f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
+        f"rank_mixer_mode={model_for_log.rank_mixer_mode}, "
+        f"multi_scale_queries={args.multi_scale_queries}"
+    )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Total parameters: {total_params:,}")
 
-    # ---- 训练：交给 trainer.py 处理 train/eval/checkpoint ----
+    # ---- Training ----
     early_stopping = EarlyStopping(
         checkpoint_path=os.path.join(args.ckpt_dir, "placeholder", "model.pt"),
         patience=args.patience,
@@ -469,6 +400,7 @@ def main() -> None:
         num_epochs=args.num_epochs,
         device=args.device,
         save_dir=args.ckpt_dir,
+        keep_top_k_best_models=args.keep_top_k_best_models,
         early_stopping=early_stopping,
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
@@ -483,9 +415,12 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         log_every_n_steps=args.log_every_n_steps,
-        max_train_steps=args.max_train_steps,
-        amp_dtype=args.amp_dtype,
         train_config=vars(args),
+        grad_accumulation_steps=args.grad_accumulation_steps,
+        use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
     )
 
     trainer.train()

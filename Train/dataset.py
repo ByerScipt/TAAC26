@@ -1,13 +1,14 @@
-"""PCVR Parquet 数据读取模块，针对训练吞吐做过优化。
+"""PCVR Parquet dataset module (performance-tuned).
 
-模块直接读取官方多列 Parquet 文件，并从 ``schema.json`` 解析特征布局。
+Reads raw multi-column Parquet directly and obtains feature metadata from
+``schema.json``.
 
-主要优化点：
-- 预分配 numpy buffer，减少 batch 内反复创建数组的开销。
-- 序列特征直接写入三维 buffer，减少 padding 和 stack 的中间对象。
-- 提前建立列名到列号的映射，避免每个 batch 反复查字符串。
-- DataLoader 多 worker 场景使用 ``file_system`` tensor 共享策略，降低
-  ``/dev/shm`` 空间不足带来的风险。
+Optimizations:
+- Pre-allocated numpy buffers to eliminate ``np.zeros`` + ``np.stack`` overhead.
+- Fused padding loop over sequence domains that writes directly into a 3D buffer.
+- Pre-computed column-index lookup to avoid per-row string lookups.
+- ``file_system`` tensor-sharing strategy to work around ``/dev/shm`` exhaustion
+  when using many DataLoader workers.
 """
 
 import os
@@ -24,8 +25,9 @@ import torch.multiprocessing
 from torch.utils.data import IterableDataset, DataLoader
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-# numpy.typing 从 numpy 1.20 开始可用。旧版本 numpy 下用一个空 shim 保持类型
-# 标注可解析，避免导入阶段因为 ``npt.NDArray[np.int64]`` 报错。
+# numpy.typing is available since numpy >= 1.20; on older numpy fall back to a
+# no-op shim so that forward-referenced annotations like ``npt.NDArray[np.int64]``
+# keep working as plain strings without raising at import time.
 try:
     import numpy.typing as npt  # noqa: F401
 except ImportError:  # pragma: no cover
@@ -35,56 +37,49 @@ except ImportError:  # pragma: no cover
     npt = _NptFallback()  # type: ignore[assignment]
 
 
-# ─────────────────────────── 特征 Schema ──────────────────────────────────
+# ─────────────────────────── Feature Schema ──────────────────────────────────
 
 
 class FeatureSchema:
-    """记录每个特征在扁平张量中的位置。
+    """Records ``(feature_id, offset, length)`` for each feature so downstream
+    code can locate the segment of the flattened tensor that belongs to a
+    specific feature id.
 
-    ``entries`` 中每一项都是 ``(feature_id, offset, length)``。下游代码通过
-    ``feature_id`` 找到对应切片，再交给 Embedding、dense projection 或 tuple
-    tokenizer 使用。
-
-    int 特征的长度规则：
+    For int features:
       - int_value: length = 1
-      - int_array: length = 数组长度
-      - int_array_and_float_array: length = int 部分长度
-
-    dense 特征的长度规则：
+      - int_array: length = array length
+      - int_array_and_float_array: int part length
+    For dense features:
       - float_value: length = 1
-      - float_array: length = 数组长度
-      - int_array_and_float_array: length = float 部分长度
+      - float_array: length = array length
+      - int_array_and_float_array: float part length
     """
 
     def __init__(self) -> None:
-        # 按 schema 顺序保存 (feature_id, offset, length)。
+        # Ordered list of (feature_id, offset, length).
         self.entries: List[Tuple[int, int, int]] = []
         self.total_dim: int = 0
-        # fid 到 (offset, length) 的快速索引。
+        # Quick lookup from fid to its (offset, length).
         self._fid_to_entry: Dict[int, Tuple[int, int]] = {}
 
     def add(self, feature_id: int, length: int) -> None:
-        """把一个特征追加到 schema 末尾。"""
+        """Append a feature to the schema."""
         offset = self.total_dim
         self.entries.append((feature_id, offset, length))
         self._fid_to_entry[feature_id] = (offset, length)
         self.total_dim += length
 
     def get_offset_length(self, feature_id: int) -> Tuple[int, int]:
-        """按 feature_id 查询 ``(offset, length)``。"""
+        """Get ``(offset, length)`` for a feature_id."""
         return self._fid_to_entry[feature_id]
-
-    def has_feature(self, feature_id: int) -> bool:
-        """判断 schema 中是否存在指定 feature_id。"""
-        return feature_id in self._fid_to_entry
 
     @property
     def feature_ids(self) -> List[int]:
-        """按插入顺序返回所有 feature_id。"""
+        """Return all feature_ids in their insertion order."""
         return [fid for fid, _, _ in self.entries]
 
     def to_dict(self) -> Dict[str, Any]:
-        """序列化成普通 dict，方便写入 JSON。"""
+        """Serialize to a plain dict (for JSON dumping)."""
         return {
             'entries': self.entries,
             'total_dim': self.total_dim,
@@ -92,7 +87,7 @@ class FeatureSchema:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'FeatureSchema':
-        """从 dict 还原 ``FeatureSchema``。"""
+        """Reconstruct a :class:`FeatureSchema` from its dict form."""
         schema = cls()
         for fid, offset, length in d['entries']:
             schema.entries.append((fid, offset, length))
@@ -107,10 +102,11 @@ class FeatureSchema:
         lines.append("])")
         return "\n".join(lines)
 
-# 多 worker DataLoader 下使用文件系统共享 tensor，缓解 /dev/shm 空间不足。
+# Use filesystem-based tensor sharing (instead of /dev/shm) to avoid running
+# out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# 时间差分桶边界。0 表示 padding，1..64 表示有效时间差桶。
+# Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
 BUCKET_BOUNDARIES = np.array([
     5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
     120, 180, 240, 300, 360, 420, 480, 540, 600,
@@ -124,48 +120,52 @@ BUCKET_BOUNDARIES = np.array([
     31536000,
 ], dtype=np.int64)
 
-# time-bucket Embedding 的槽位数，包含 padding=0。
+# Total number of time-bucket embedding slots (= number of boundaries + 1, with
+# padding=0 included).
 #
-# 该常量由 BUCKET_BOUNDARIES 的长度唯一决定。model.py 里的
-# ``nn.Embedding(num_embeddings=NUM_TIME_BUCKETS)`` 必须与这里一致，否则运行时
-# 会出现 Embedding 索引越界。
+# This constant is uniquely determined by the length of BUCKET_BOUNDARIES; on
+# the model side, ``nn.Embedding(num_embeddings=NUM_TIME_BUCKETS)`` must match
+# this value exactly, otherwise an IndexError may be raised at runtime.
 #
-# 因此 train.py / infer.py 只暴露 ``--use_time_buckets`` 开关，具体桶数统一从这里派生。
+# That is why ``train.py`` / ``infer.py`` only expose the boolean flag
+# ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
-SEQ_CALENDAR_FEATURE_NAMES = (
-    'hour_of_day',
-    'day_of_week',
-    'day_of_month',
-)
-SEQ_CALENDAR_FEATURE_DIM = len(SEQ_CALENDAR_FEATURE_NAMES)
-LOCAL_TIME_OFFSET_SECONDS = 8 * 3600
+# 当前样本的日历特征。0 保留给 padding，真实取值从 1 开始。
+NUM_HOUR_BUCKETS = 25      # 1..24 表示小时
+NUM_DOW_BUCKETS = 8        # 1..7 表示周一到周日
+NUM_DOM_BUCKETS = 32       # 1..31 表示月内日期
 
-ENGINEERED_DENSE_DOMAINS = ('seq_a', 'seq_b', 'seq_c', 'seq_d')
-ENGINEERED_DENSE_FEATURE_NAMES = [
-    f'{domain}_{feature}'
-    for domain in ENGINEERED_DENSE_DOMAINS
-    for feature in (
-        'log1p_len',
-        'log1p_last_gap',
-        'missing_history',
-        'gap_le_60',
-        'gap_le_3600',
-        'gap_le_86400',
-    )
-]
-ENGINEERED_DENSE_DIM = len(ENGINEERED_DENSE_FEATURE_NAMES)
+
+def build_calendar_feature_ids(
+    timestamps: "npt.NDArray[np.int64]",
+) -> Tuple["npt.NDArray[np.int64]", "npt.NDArray[np.int64]", "npt.NDArray[np.int64]"]:
+    """把当前样本 timestamp 转成 hour/dow/dom 三个 embedding id。"""
+    import time
+
+    # 沿用原实现：使用运行环境本地时区，保证和既有 checkpoint 的特征路径一致。
+    tz_offset = -time.timezone if not time.daylight else -time.altzone
+    local_timestamps = timestamps + tz_offset
+
+    hour = (local_timestamps % 86400) // 3600 + 1
+    day_of_week = (local_timestamps // 86400 + 3) % 7 + 1
+    dt = local_timestamps.astype('datetime64[s]').astype('datetime64[D]')
+    day_of_month = np.array([
+        int(str(d).split('-')[2]) if str(d) != 'NaT' else 0
+        for d in dt
+    ], dtype=np.int64)
+
+    return hour.astype(np.int64), day_of_week.astype(np.int64), day_of_month.astype(np.int64)
 
 
 class PCVRParquetDataset(IterableDataset):
-    """直接读取官方多列 Parquet 的 IterableDataset。
+    """PCVR dataset that reads raw multi-column Parquet directly.
 
-    输出 batch 已经是模型可消费的 tensor 字典：
-    - int 特征：标量或 list，多值特征按 padding=0 补齐，所有 <=0 的值映射为 0。
-    - dense 特征：``list<float>``，按 schema 中的最大长度补齐。
-    - sequence 特征：按 seq_a/seq_b/seq_c/seq_d 分域组织，形状为 ``[B, S, L]``。
-    - time bucket：由当前样本 timestamp 与序列事件 timestamp 的差值分桶得到。
-    - label：训练时由 ``label_type == 2`` 映射得到二分类标签。
+    - int features: scalar or list (multi-hot); values <= 0 are mapped to 0 (padding).
+    - dense features: ``list<float>``, variable-length padded up to ``max_dim``.
+    - sequence features: ``list<int64>``, grouped by domain; includes side-info
+      columns and an optional timestamp column (used for time-bucketing).
+    - label: mapped from ``label_type == 2``.
     """
 
     def __init__(
@@ -179,29 +179,27 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
-        return_user_id: bool = False,
     ) -> None:
-        """初始化 parquet 文件、schema 和可复用 buffer。
-
-        参数：
-            parquet_path: parquet 文件目录，或单个 parquet 文件路径。
-            schema_path: 描述特征布局的 schema JSON 路径。
-            batch_size: 预分配 buffer 使用的固定 batch size。
-            seq_max_lens: 每个序列域的截断长度覆盖配置，例如 ``{'seq_d': 256}``。
-                未配置的序列域使用默认长度 256。
-            shuffle: 是否在 ``buffer_batches`` 个 batch 的窗口内打乱样本。
-            buffer_batches: shuffle buffer 大小，单位是 batch。
-            row_group_range: Row Group 的 ``(start, end)`` 切片；为 ``None`` 时使用
-                全部 Row Group。
-            clip_vocab: 为 True 时越界 ID 会裁剪为 0；为 False 时直接报错。
-            is_training: 为 True 时从 ``label_type == 2`` 生成 label；推理时返回
-                全 0 label 占位。
-            return_user_id: 为 True 时返回原始 user_id。训练阶段保持 False，减少
-                Python list 转换开销。
+        """
+        Args:
+            parquet_path: either a directory containing ``*.parquet`` files or
+                a single parquet file path.
+            schema_path: path of the schema JSON describing feature layouts.
+            batch_size: fixed batch size used for the pre-allocated buffers.
+            seq_max_lens: optional per-domain override of sequence truncation,
+                e.g. ``{'seq_d': 256}``. Domains not listed fall back to the
+                schema default of 256.
+            shuffle: whether to shuffle within a ``buffer_batches``-sized window.
+            buffer_batches: shuffle buffer size in units of batches.
+            row_group_range: ``(start, end)`` slice of Row Groups; ``None`` to
+                use all Row Groups.
+            clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
+            is_training: if True, derive ``label`` from ``label_type == 2``;
+                if False, return an all-zeros label column.
         """
         super().__init__()
 
-        # parquet_path 支持目录和单文件两种形式。
+        # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
             import glob
             files = sorted(glob.glob(os.path.join(parquet_path, '*.parquet')))
@@ -216,12 +214,8 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
-        self.return_user_id = return_user_id
-        # 越界 ID 统计，格式：
-        #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
-        self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
 
-        # 建立所有 Row Group 的索引列表。
+        # Build the list of Row Groups.
         self._rg_list = []
         for f in self._parquet_files:
             pf = pq.ParquetFile(f)
@@ -234,34 +228,30 @@ class PCVRParquetDataset(IterableDataset):
 
         self.num_rows = sum(r[2] for r in self._rg_list)
 
-        # 读取 schema.json，并建立各类特征的布局。
+        # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
 
-        # ---- 提前建立列名到列号的映射 ----
+        # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
         schema_names = pf.schema_arrow.names
         self._col_idx = {name: i for i, name in enumerate(schema_names)}
 
-        # ---- 预分配 numpy buffer ----
+        # ---- Pre-allocate numpy buffers ----
         B = batch_size
         self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
-        self._buf_seq_calendar = {}
         self._buf_seq_lens = {}
-        self._buf_engineered_dense = np.zeros((B, ENGINEERED_DENSE_DIM), dtype=np.float32)
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
-            self._buf_seq_calendar[domain] = np.zeros(
-                (B, SEQ_CALENDAR_FEATURE_DIM, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
-        # ---- 为 int 列提前生成读取计划：(col_idx, offset, vocab_size) ----
+        # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
         self._user_int_plan = []  # [(col_idx, dim, offset, vocab_size), ...]
         offset = 0
         for fid, vs, dim in self._user_int_cols:
@@ -275,6 +265,11 @@ class PCVRParquetDataset(IterableDataset):
             ci = self._col_idx.get(f'item_int_feats_{fid}')
             self._item_int_plan.append((ci, dim, offset, vs))
             offset += dim
+        self._item_fid11_offset_length = (
+            self.item_int_schema.get_offset_length(11)
+            if 11 in self.item_int_schema.feature_ids
+            else None
+        )
 
         self._user_dense_plan = []
         offset = 0
@@ -283,7 +278,7 @@ class PCVRParquetDataset(IterableDataset):
             self._user_dense_plan.append((ci, dim, offset))
             offset += dim
 
-        # 序列列读取计划：{domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
+        # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
         for domain in self.seq_domains:
             prefix = self._seq_prefix[domain]
@@ -303,7 +298,7 @@ class PCVRParquetDataset(IterableDataset):
             f"buffer_batches={buffer_batches}, shuffle={shuffle}")
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
-        """从 ``schema_path`` 解析 user/item/sequence 的特征布局。"""
+        """Populate per-group schema information from ``schema_path``."""
         with open(schema_path, 'r', encoding='utf-8') as f:
             raw = json.load(f)
 
@@ -329,10 +324,10 @@ class PCVRParquetDataset(IterableDataset):
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
 
-        # ---- item_dense 当前为空，保留 schema 位置以兼容模型接口 ----
+        # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
 
-        # ---- sequence domains：解析 seq_a/seq_b/seq_c/seq_d 的 sideinfo 和 timestamp ----
+        # ---- sequence domains ----
         self._seq_cfg: Dict[str, Dict[str, Any]] = raw['seq']
         self.seq_domains: List[str] = sorted(self._seq_cfg.keys())
         self.seq_feature_ids: Dict[str, List[int]] = {}
@@ -359,11 +354,11 @@ class PCVRParquetDataset(IterableDataset):
                 self.seq_vocab_sizes[domain][fid] for fid in sideinfo
             ]
 
-            # max_len 来自命令行覆盖配置，未配置的序列域使用 256。
+            # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
 
     def __len__(self) -> int:
-        # 按 Row Group 逐个向上取整，得到 batch 数上界。
+        # Ceiling per Row Group; this is an upper bound on the true batch count.
         return sum((n + self.batch_size - 1) // self.batch_size
                    for _, _, n in self._rg_list)
 
@@ -396,7 +391,8 @@ class PCVRParquetDataset(IterableDataset):
     def _flush_buffer(
         self, buffer: List[Dict[str, Any]]
     ) -> Iterator[Dict[str, Any]]:
-        """合并 shuffle buffer 中的 batch，按样本粒度打乱后再切回 batch。
+        """Concatenate the buffered batches, shuffle at the row level, then
+        re-slice and yield batch-sized chunks.
         """
         merged: Dict[str, torch.Tensor] = {}
         non_tensor_keys: Dict[str, Any] = {}
@@ -415,7 +411,7 @@ class PCVRParquetDataset(IterableDataset):
         del merged
         buffer.clear()
 
-    # ---- 辅助函数 ----
+    # ---- Helpers ----
 
     def _record_oob(
         self,
@@ -424,57 +420,21 @@ class PCVRParquetDataset(IterableDataset):
         arr: "npt.NDArray[np.int64]",
         vocab_size: int,
     ) -> None:
-        """记录 ID 越界情况，并按配置把越界值裁剪成 0。
-
-        统计先缓存在内存里，避免训练过程中频繁向控制台打印。
-        """
+        """处理越界 id：训练默认置 0；关闭 clip_vocab 时直接报错。"""
         oob_mask = arr >= vocab_size
         if not oob_mask.any():
             return
-        key = (group, col_idx)
+        if self.clip_vocab:
+            arr[oob_mask] = 0
+            return
         oob_vals = arr[oob_mask]
         n = int(oob_mask.sum())
         mx = int(oob_vals.max())
         mn = int(oob_vals.min())
-        if key in self._oob_stats:
-            s = self._oob_stats[key]
-            s['count'] += n
-            s['max'] = max(s['max'], mx)
-            s['min_oob'] = min(s['min_oob'], mn)
-        else:
-            self._oob_stats[key] = {
-                'count': n, 'max': mx, 'min_oob': mn, 'vocab': vocab_size,
-            }
-        if self.clip_vocab:
-            arr[oob_mask] = 0
-        else:
-            raise ValueError(
-                f"{group} col_idx={col_idx}: {n} values out of range "
-                f"[0, {vocab_size}), actual=[{mn}, {mx}]. "
-                f"Use clip_vocab=True to clip or fix schema.json")
-
-    def dump_oob_stats(self, path: Optional[str] = None) -> None:
-        """输出 ID 越界统计。
-
-        传入 ``path`` 时写文件；未传入时写入 ``logging.info``。
-        """
-        if not self._oob_stats:
-            logging.info("No out-of-bound values detected.")
-            return
-        lines = ["=== Out-of-Bound Stats ==="]
-        for (group, ci), s in sorted(self._oob_stats.items()):
-            direction = "TOO_HIGH" if s['min_oob'] >= s['vocab'] else "TOO_LOW"
-            lines.append(
-                f"  {group} col_idx={ci}: vocab={s['vocab']}, "
-                f"oob_count={s['count']}, range=[{s['min_oob']}, {s['max']}], "
-                f"{direction}")
-        msg = "\n".join(lines)
-        if path:
-            with open(path, 'w') as f:
-                f.write(msg + "\n")
-            logging.info(f"OOB stats written to {path}")
-        else:
-            logging.info(msg)
+        raise ValueError(
+            f"{group} col_idx={col_idx}: {n} values out of range "
+            f"[0, {vocab_size}), actual=[{mn}, {mx}]. "
+            f"Use clip_vocab=True to clip or fix schema.json")
 
     def _pad_varlen_int_column(
         self,
@@ -482,14 +442,14 @@ class PCVRParquetDataset(IterableDataset):
         max_len: int,
         B: int,
     ) -> Tuple["npt.NDArray[np.int64]", "npt.NDArray[np.int64]"]:
-        """把 Arrow ``ListArray`` 中的 int list 补齐成 ``[B, max_len]``。
+        """Pad an Arrow ``ListArray`` of ints to shape ``[B, max_len]``.
 
-        所有 <=0 的值都会映射为 padding=0。原始数据中的 -1 表示缺失，这里和 0
-        使用同一套 padding 语义。
+        Values <= 0 are mapped to 0 (padding). Note: the raw data contains -1
+        (missing); currently treated the same way as 0 (padding).
 
-        返回：
-            ``(padded, lengths)``。``padded`` 形状为 ``[B, max_len]``，
-            ``lengths`` 形状为 ``[B]``。
+        Returns:
+            A tuple ``(padded, lengths)`` where ``padded`` has shape
+            ``[B, max_len]`` and ``lengths`` has shape ``[B]``.
         """
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
@@ -509,94 +469,10 @@ class PCVRParquetDataset(IterableDataset):
         padded[padded <= 0] = 0
         return padded, lengths
 
-    # 兼容旧脚本 bench_raw_dataset.py 和重命名前的外部调用。新代码直接调用
-    # `_pad_varlen_int_column`。
+    # Backwards-compatible alias kept for bench_raw_dataset.py and other
+    # external callers that pre-date the rename. New code should call
+    # `_pad_varlen_int_column` directly.
     _pad_varlen_column = _pad_varlen_int_column
-
-    def _compute_engineered_dense_feats(
-        self,
-        batch: "pa.RecordBatch",
-        timestamps: "npt.NDArray[np.int64]",
-        B: int,
-    ) -> "npt.NDArray[np.float32]":
-        """计算显式 recency 和原始序列长度 dense 特征。"""
-        feats = self._buf_engineered_dense[:B]
-        feats[:] = 0.0
-
-        for domain_idx, domain in enumerate(ENGINEERED_DENSE_DOMAINS):
-            side_plan, ts_ci = self._seq_plan[domain]
-            base = domain_idx * 6
-
-            if ts_ci is None:
-                fallback_ci = side_plan[0][0]
-                fallback_col = batch.column(fallback_ci)
-                fallback_offs = fallback_col.offsets.to_numpy()
-                for i in range(B):
-                    raw_seq_len = int(fallback_offs[i + 1]) - int(fallback_offs[i])
-                    feats[i, base] = np.log1p(max(raw_seq_len, 0))
-                    feats[i, base + 2] = 1.0
-                continue
-
-            ts_col = batch.column(ts_ci)
-            ts_offs = ts_col.offsets.to_numpy()
-            ts_vals = ts_col.values.to_numpy()
-
-            for i in range(B):
-                start = int(ts_offs[i])
-                end = int(ts_offs[i + 1])
-                raw_seq_len = max(end - start, 0)
-                row_ts = ts_vals[start:end]
-                valid_ts = row_ts[row_ts > 0]
-
-                feats[i, base] = np.log1p(raw_seq_len)
-                if valid_ts.size == 0:
-                    feats[i, base + 2] = 1.0
-                    continue
-
-                last_ts = int(valid_ts.max())
-                last_gap = max(int(timestamps[i]) - last_ts, 0)
-                feats[i, base + 1] = np.log1p(last_gap)
-                feats[i, base + 3] = 1.0 if last_gap <= 60 else 0.0
-                feats[i, base + 4] = 1.0 if last_gap <= 3600 else 0.0
-                feats[i, base + 5] = 1.0 if last_gap <= 86400 else 0.0
-
-        return feats
-
-    def _compute_seq_calendar_features(
-        self,
-        ts_padded: "npt.NDArray[np.int64]",
-    ) -> "npt.NDArray[np.int64]":
-        """Convert per-event unix timestamps into compact local-calendar ids.
-
-        Output shape is ``[B, 3, L]``. Every feature reserves id=0 for padding:
-        hour 1..24, day-of-week 1..7, day-of-month 1..31.
-        Timestamps are shifted to UTC+8 before calendar extraction
-        to match the competition logs' Beijing-time interpretation.
-        """
-        B, L = ts_padded.shape
-        calendar = np.zeros((B, SEQ_CALENDAR_FEATURE_DIM, L), dtype=np.int64)
-        valid = ts_padded > 0
-        if not valid.any():
-            return calendar
-
-        local_seconds = ts_padded[valid] + LOCAL_TIME_OFFSET_SECONDS
-        days = local_seconds // 86400
-        seconds_in_day = local_seconds % 86400
-
-        hour = seconds_in_day // 3600
-        # 1970-01-01 was Thursday. Monday=0, Sunday=6.
-        day_of_week = (days + 3) % 7
-
-        months = local_seconds.astype('datetime64[s]').astype('datetime64[M]')
-        day_of_month = (
-            local_seconds.astype('datetime64[s]').astype('datetime64[D]')
-            - months.astype('datetime64[D]')
-        ).astype(np.int64)
-
-        calendar[:, 0, :][valid] = hour + 1
-        calendar[:, 1, :][valid] = day_of_week + 1
-        calendar[:, 2, :][valid] = day_of_month + 1
-        return calendar
 
     def _pad_varlen_float_column(
         self,
@@ -604,7 +480,7 @@ class PCVRParquetDataset(IterableDataset):
         max_dim: int,
         B: int,
     ) -> "npt.NDArray[np.float32]":
-        """把 Arrow ``ListArray<float>`` 补齐成 ``[B, max_dim]``。"""
+        """Pad an Arrow ``ListArray<float>`` to shape ``[B, max_dim]``."""
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
 
@@ -621,21 +497,26 @@ class PCVRParquetDataset(IterableDataset):
         return padded
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
-        """把 Arrow RecordBatch 转成模型训练可直接使用的 tensor 字典。"""
+        """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
 
-        # ---- meta：样本时间戳和二分类标签 ----
+        # ---- meta ----
         timestamps = batch.column(self._col_idx['timestamp']).to_numpy().astype(np.int64)
         if self.is_training:
             labels = (batch.column(self._col_idx['label_type']).fill_null(0)
                       .to_numpy(zero_copy_only=False).astype(np.int64) == 2).astype(np.int64)
         else:
             labels = np.zeros(B, dtype=np.int64)
+        user_ids = batch.column(self._col_idx['user_id']).to_pylist()
 
-        # ---- user_int：写入预分配 buffer ----
-        # null 会通过 fill_null 变成 0，-1 会通过 arr<=0 变成 0。缺失值和 padding
-        # 共享 ID=0。vs==0 表示 schema 缺少词表信息，dataset 侧整列置 0，保证模型
-        # 中 1 槽 Embedding 不会越界。
+        hour, day_of_week, day_of_month = build_calendar_feature_ids(timestamps)
+
+        # ---- user_int: write into pre-allocated buffer ----
+        # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
+        # are treated the same as padding. Features with vs==0 have no vocab
+        # information and are forced to 0 on the dataset side so that the
+        # model's 1-slot Embedding (created for vs=0) is never indexed out of
+        # range.
         user_int = self._buf_user_int[:B]
         user_int[:] = 0
         for ci, dim, offset, vs in self._user_int_plan:
@@ -656,7 +537,7 @@ class PCVRParquetDataset(IterableDataset):
                     padded[:] = 0
                 user_int[:, offset:offset + dim] = padded
 
-        # ---- item_int：处理方式和 user_int 一致 ----
+        # ---- item_int ----
         item_int = self._buf_item_int[:B]
         item_int[:] = 0
         for ci, dim, offset, vs in self._item_int_plan:
@@ -677,7 +558,17 @@ class PCVRParquetDataset(IterableDataset):
                     padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
 
-        # ---- user_dense：变长 float list 补齐后写入扁平 dense 张量 ----
+        item_fid11_len = np.zeros(B, dtype=np.int64)
+        if self._item_fid11_offset_length is not None:
+            fid11_offset, fid11_width = self._item_fid11_offset_length
+            fid11_vals = item_int[:, fid11_offset:fid11_offset + fid11_width]
+            item_fid11_len[:] = np.clip(
+                np.count_nonzero(fid11_vals > 0, axis=1),
+                0,
+                20,
+            )
+
+        # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]
         user_dense[:] = 0
         for ci, dim, offset in self._user_dense_plan:
@@ -689,28 +580,30 @@ class PCVRParquetDataset(IterableDataset):
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
+            'item_fid11_len': torch.from_numpy(item_fid11_len.copy()),
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
-            'engineered_dense_feats': torch.from_numpy(
-                self._compute_engineered_dense_feats(batch, timestamps, B).copy()),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
+            'user_id': user_ids,
             '_seq_domains': self.seq_domains,
+            'hour': torch.from_numpy(hour),
+            'day_of_week': torch.from_numpy(day_of_week),
+            'day_of_month': torch.from_numpy(day_of_month),
         }
-        if self.return_user_id:
-            result['user_id'] = batch.column(self._col_idx['user_id']).to_pylist()
 
-        # ---- Sequence features：直接把每个序列域写入三维 buffer ----
+        # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
-            # 直接复用预分配的三维 buffer，形状为 [B, S, L]。
+            # Write directly into the pre-allocated 3D buffer.
             out = self._buf_seq[domain][:B]
             out[:] = 0
             lengths = self._buf_seq_lens[domain][:B]
             lengths[:] = 0
 
-            # 先收集每个 side-info 列的 offsets、values、词表大小和列号，再统一填充。
+            # Fused path: first collect (offsets, values, vocab_size, col_idx)
+            # for every side-info column, then fill the buffer in a single pass.
             col_data = []
             for ci, slot, vs in side_plan:
                 col = batch.column(ci)
@@ -728,11 +621,12 @@ class PCVRParquetDataset(IterableDataset):
                     if ul > lengths[i]:
                         lengths[i] = ul
 
-            # 所有 <=0 的序列取值映射到 padding=0。
+            # Values <= 0 -> 0.
             out[out <= 0] = 0
 
-            # 按每个 side-info 特征的 vocab_size 检查越界。vs==0 表示没有词表信息，
-            # 该特征整片置 0，避免模型侧 Embedding 越界。
+            # Check out-of-bound values per feature's vocab_size.
+            # vs==0 means no vocab info; force the whole slice to 0 so that
+            # the model's 1-slot Embedding is never indexed out of range.
             for c, (_, _, vs, ci) in enumerate(col_data):
                 slice_c = out[:, c, :]
                 if vs > 0:
@@ -743,16 +637,14 @@ class PCVRParquetDataset(IterableDataset):
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
-            # 时间差分桶：当前样本 timestamp 减去序列事件 timestamp。
+            # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
-            calendar_feats = self._buf_seq_calendar[domain][:B]
-            calendar_feats[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                # 把事件 timestamp 补齐成 (B, max_len)。
+                # Pad timestamps into shape (B, max_len).
                 ts_padded = np.zeros((B, max_len), dtype=np.int64)
                 for i in range(B):
                     s = int(ts_offs[i])
@@ -765,9 +657,15 @@ class PCVRParquetDataset(IterableDataset):
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
-                # np.searchsorted 的原始结果范围是 [0, len(BUCKET_BOUNDARIES)]。
-                # 加 1 后作为有效 bucket id。超过最大边界的时间差会裁剪到最后一个
-                # bucket，保证最终索引落在 time_embedding 的有效范围内。
+                # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
+                # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
+                # the upper bound only appears when time_diff exceeds the
+                # largest boundary (~1 year) and would index past
+                # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
+                # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
+                # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
+                # and is always a valid Embedding index. Time-diffs beyond the
+                # largest boundary collapse into the last bucket.
                 raw_buckets = np.clip(
                     np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
                     0, len(BUCKET_BOUNDARIES) - 1,
@@ -775,10 +673,8 @@ class PCVRParquetDataset(IterableDataset):
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
-                calendar_feats[:] = self._compute_seq_calendar_features(ts_padded)
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
-            result[f'{domain}_calendar_feats'] = torch.from_numpy(calendar_feats.copy())
 
         return result
 
@@ -790,24 +686,23 @@ def get_pcvr_data(
     valid_ratio: float = 0.1,
     train_ratio: float = 1.0,
     num_workers: int = 16,
-    valid_num_workers: int = -1,
     buffer_batches: int = 20,
     shuffle_train: bool = True,
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
-    return_user_id: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
-    """从官方多列 Parquet 文件创建 train / valid DataLoader。
+    """Create train / valid DataLoaders from raw multi-column Parquet files.
 
-    验证集取文件顺序下最后 ``valid_ratio`` 比例的 Row Group。当前比赛主线保留
-    baseline 的原始划分方式，本地 AUC 和线上分数会因此存在偏差，但训练能覆盖更新的
-    数据分布。
+    The validation split is taken as the last ``valid_ratio`` fraction of Row
+    Groups (in the file order returned by ``glob``).
 
-    返回：
-        ``(train_loader, valid_loader, train_dataset)``。第三个返回值提供
-        ``user_int_schema``、``item_int_schema`` 等信息，train.py 用它构建模型。
+    Returns:
+        A tuple ``(train_loader, valid_loader, train_dataset)``. The third
+        element is returned so the caller can access the feature schema
+        (``user_int_schema``, ``item_int_schema``, ...) needed to construct
+        the model.
     """
     random.seed(seed)
 
@@ -822,35 +717,18 @@ def get_pcvr_data(
     total_rgs = len(rg_info)
 
     n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    train_end = total_rgs - n_valid_rgs
-    n_train_use_rgs = train_end
+    n_train_rgs = total_rgs - n_valid_rgs
 
-    # train_ratio 用于只取训练 Row Group 的前 N%，主要服务快速 smoke test。
+    # train_ratio 只截取训练 Row Group 的前缀部分。
     if train_ratio < 1.0:
-        n_train_use_rgs = max(1, int(train_end * train_ratio))
-        logging.info(
-            f"train_ratio={train_ratio}: using {n_train_use_rgs}/{train_end} "
-            "pre-validation train Row Groups")
+        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-    train_range = (0, n_train_use_rgs)
-    valid_range = (train_end, total_rgs)
+    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
 
-    train_rows = sum(r[2] for r in rg_info[train_range[0]:train_range[1]])
-    valid_rows = sum(r[2] for r in rg_info[valid_range[0]:valid_range[1]])
-
-    use_cuda = torch.cuda.is_available()
-    if valid_num_workers < 0:
-        valid_num_workers = num_workers
-
-    logging.info(
-        "Row Group split: "
-        f"total_rgs={total_rgs}, "
-        f"train_range={train_range}, "
-        f"valid_range={valid_range}, "
-        f"train_rows={train_rows}, "
-        f"valid_rows={valid_rows}, "
-        f"num_workers={num_workers}, "
-        f"valid_num_workers={valid_num_workers}")
+    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                 f"{n_valid_rgs} valid ({valid_rows} rows)")
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -859,11 +737,11 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=train_range,
+        row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
-        return_user_id=return_user_id,
     )
 
+    use_cuda = torch.cuda.is_available()
     _train_kw = {}
     if num_workers > 0:
         _train_kw['persistent_workers'] = True
@@ -874,11 +752,6 @@ def get_pcvr_data(
         num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
     )
 
-    _valid_kw = {}
-    if valid_num_workers > 0:
-        _valid_kw['persistent_workers'] = True
-        _valid_kw['prefetch_factor'] = 2
-
     valid_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -886,17 +759,15 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=valid_range,
+        row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
-        return_user_id=return_user_id,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
-        num_workers=valid_num_workers, pin_memory=use_cuda, **_valid_kw,
+        num_workers=0, pin_memory=use_cuda,
     )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
-                 f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
-                 f"num_workers={num_workers}, valid_num_workers={valid_num_workers}")
+                 f"batch_size={batch_size}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset
