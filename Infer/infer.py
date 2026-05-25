@@ -48,7 +48,7 @@ logging.basicConfig(
 # When the feature is enabled we therefore use the constant exposed by the
 # dataset module; ``0`` means disabled.
 _FALLBACK_MODEL_CFG = {
-    'd_model': 64,
+    'd_model': 60,
     'emb_dim': 64,
     'num_queries': 1,
     'num_hyformer_blocks': 2,

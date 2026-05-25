@@ -530,24 +530,55 @@ class MultiSeqQueryGenerator(nn.Module):
                 [query, seq_tokens, query - seq_tokens, query * seq_tokens],
                 dim=-1,
             )  # (B, L_i, 4D)
-            attn_logits = self.din_attn_mlp(attn_in).squeeze(-1)  # (B, L_i)
-            attn_logits = attn_logits.masked_fill(~valid_mask, -1e9)
-            attn_weights = F.softmax(attn_logits, dim=1)  # (B, L_i)
-            attn_weights = attn_weights * valid_mask.float()
-            weight_denom = attn_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            attn_weights = attn_weights / weight_denom
-            seq_pooled = torch.bmm(
-                attn_weights.unsqueeze(1),
-                seq_tokens,
-            ).squeeze(1)  # (B, D)
+            attn_logits_base = self.din_attn_mlp(attn_in).squeeze(-1)  # (B, L_i)
 
-            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)。
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
-            global_info = self.global_info_norm(global_info)
+            if self.num_queries == 3:
+                # 多尺度时间兴趣：short/mid/long = 有效长度的10% / 70% / 100%。
+                B_i, L_i, _ = seq_tokens_list[i].shape
+                device = seq_tokens_list[i].device
+                pos = torch.arange(L_i, device=device).unsqueeze(0).expand(B_i, -1)
+                valid_len = valid_mask.sum(dim=1)  # (B,)
 
-            # 生成 N 个 query token。
-            queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
-            q_tokens = torch.stack(queries, dim=1)  # (B, Nq, D)
+                short_end = torch.ceil(valid_len.float() * 0.10).long().clamp(min=1)
+                mid_end = torch.ceil(valid_len.float() * 0.70).long().clamp(min=1)
+
+                short_mask = valid_mask & (pos < short_end.unsqueeze(1))
+                mid_mask = valid_mask & (pos < mid_end.unsqueeze(1))
+                long_mask = valid_mask
+                view_masks = [short_mask, mid_mask, long_mask]
+
+                queries = []
+                for q_idx, view_mask in enumerate(view_masks):
+                    attn_logits = attn_logits_base.masked_fill(~view_mask, -1e9)
+                    attn_weights = F.softmax(attn_logits, dim=1)
+                    attn_weights = attn_weights * view_mask.float()
+                    weight_denom = attn_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                    attn_weights = attn_weights / weight_denom
+                    seq_pooled = torch.bmm(
+                        attn_weights.unsqueeze(1),
+                        seq_tokens,
+                    ).squeeze(1)  # (B, D)
+
+                    global_info = torch.cat([ns_flat, seq_pooled], dim=-1)
+                    global_info = self.global_info_norm(global_info)
+                    queries.append(self.query_ffns_per_seq[i][q_idx](global_info))
+                q_tokens = torch.stack(queries, dim=1)  # (B, 3, D)
+            else:
+                # 默认路径：全历史 DIN pooling 生成所有 query。
+                attn_logits = attn_logits_base.masked_fill(~valid_mask, -1e9)
+                attn_weights = F.softmax(attn_logits, dim=1)
+                attn_weights = attn_weights * valid_mask.float()
+                weight_denom = attn_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                attn_weights = attn_weights / weight_denom
+                seq_pooled = torch.bmm(
+                    attn_weights.unsqueeze(1),
+                    seq_tokens,
+                ).squeeze(1)  # (B, D)
+
+                global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+                global_info = self.global_info_norm(global_info)
+                queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
+                q_tokens = torch.stack(queries, dim=1)  # (B, Nq, D)
             q_tokens_list.append(q_tokens)
 
         return q_tokens_list
@@ -1010,10 +1041,37 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
-            decoded_q_i = self.cross_attns[i](
-                q_tokens_list[i], next_seqs[i], next_masks[i],
-                rope_cos=rc, rope_sin=rs,
-            )
+            if Nq == 3:
+                # Query-View 对齐：q0->short(10%), q1->mid(70%), q2->long(100%)
+                B_i, L_i, _ = next_seqs[i].shape
+                device = next_seqs[i].device
+                base_valid = ~next_masks[i]
+                valid_len = base_valid.sum(dim=1)
+                pos = torch.arange(L_i, device=device).unsqueeze(0).expand(B_i, -1)
+
+                short_end = torch.ceil(valid_len.float() * 0.10).long().clamp(min=1)
+                mid_end = torch.ceil(valid_len.float() * 0.70).long().clamp(min=1)
+                short_valid = base_valid & (pos < short_end.unsqueeze(1))
+                mid_valid = base_valid & (pos < mid_end.unsqueeze(1))
+                long_valid = base_valid
+                view_masks = [~short_valid, ~mid_valid, ~long_valid]  # True=padding
+
+                q_views = []
+                for q_idx, view_mask in enumerate(view_masks):
+                    q_view = self.cross_attns[i](
+                        q_tokens_list[i][:, q_idx:q_idx + 1, :],
+                        next_seqs[i],
+                        view_mask,
+                        rope_cos=rc,
+                        rope_sin=rs,
+                    )
+                    q_views.append(q_view)
+                decoded_q_i = torch.cat(q_views, dim=1)
+            else:
+                decoded_q_i = self.cross_attns[i](
+                    q_tokens_list[i], next_seqs[i], next_masks[i],
+                    rope_cos=rc, rope_sin=rs,
+                )
             decoded_qs.append(decoded_q_i)
 
         # 3. Token Fusion：拼接所有 decoded Q 和 NS token。

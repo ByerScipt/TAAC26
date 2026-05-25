@@ -8,7 +8,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
-    --num_queries 2 \
+    --num_queries 3 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
@@ -22,6 +22,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --use_shared_fid_tuple_token \
     --shared_fids 62,63,64,65,66 \
     --shared_fid_tuple_mode replace \
+    --d_model 60 \
     "$@"
 
 # ---- 备选配置：由 ns_groups.json 驱动的 GroupNSTokenizer ----
