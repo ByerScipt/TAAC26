@@ -19,7 +19,13 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    get_pcvr_data,
+    NUM_TIME_BUCKETS,
+    ENGINEERED_DENSE_DIM,
+    ENGINEERED_DENSE_FEATURE_NAMES,
+)
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -71,6 +77,9 @@ def parse_args() -> argparse.Namespace:
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
                         help='Number of DataLoader workers')
+    parser.add_argument('--valid_num_workers', type=int, default=-1,
+                        help='Number of validation DataLoader workers '
+                             '(-1 = reuse --num_workers)')
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
@@ -184,6 +193,12 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
+    parser.add_argument('--use_engineered_dense_features', action='store_true', default=True,
+                        help='Enable explicit recency + raw sequence length dense features')
+    parser.add_argument('--no_engineered_dense_features',
+                        dest='use_engineered_dense_features',
+                        action='store_false',
+                        help='Disable explicit engineered dense features')
 
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
@@ -228,6 +243,10 @@ def main() -> None:
     set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
+    logging.info("Experiment: exp_004_recency_length_dense_features")
+    logging.info(f"use_engineered_dense_features={args.use_engineered_dense_features}")
+    logging.info(f"engineered_dense_dim={ENGINEERED_DENSE_DIM}")
+    logging.info(f"engineered feature names={ENGINEERED_DENSE_FEATURE_NAMES}")
 
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(args.tf_events_dir)
@@ -257,6 +276,7 @@ def main() -> None:
         valid_ratio=args.valid_ratio,
         train_ratio=args.train_ratio,
         num_workers=args.num_workers,
+        valid_num_workers=args.valid_num_workers,
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
@@ -312,9 +332,16 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "use_engineered_dense_features": args.use_engineered_dense_features,
+        "engineered_dense_dim": ENGINEERED_DENSE_DIM,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+    if args.use_engineered_dense_features:
+        logging.info(
+            "engineered_alpha initial value="
+            f"{float(model.engineered_alpha.detach().cpu().item()):.1f}"
+        )
 
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)

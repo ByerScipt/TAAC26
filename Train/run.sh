@@ -1,6 +1,7 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
@@ -11,9 +12,12 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --valid_num_workers 4 \
+    --batch_size 256 \
+    --log_every_n_steps 151 \
     --patience 3 \
-    --log_every_n_steps 200 \
     --amp_dtype bf16 \
+    --use_engineered_dense_features \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

@@ -153,7 +153,6 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
-        return_user_id: bool = False,
     ) -> None:
         """
         Args:
@@ -171,8 +170,6 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
-            return_user_id: if True, include raw user_id values in the returned
-                batch. Keep False for training to avoid Python list conversion.
         """
         super().__init__()
 
@@ -191,7 +188,6 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
-        self.return_user_id = return_user_id
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -517,6 +513,7 @@ class PCVRParquetDataset(IterableDataset):
                       .to_numpy(zero_copy_only=False).astype(np.int64) == 2).astype(np.int64)
         else:
             labels = np.zeros(B, dtype=np.int64)
+        user_ids = batch.column(self._col_idx['user_id']).to_pylist()
 
         # ---- user_int: write into pre-allocated buffer ----
         # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
@@ -580,10 +577,9 @@ class PCVRParquetDataset(IterableDataset):
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
+            'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }
-        if self.return_user_id:
-            result['user_id'] = batch.column(self._col_idx['user_id']).to_pylist()
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
@@ -685,7 +681,6 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
-    return_user_id: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -734,7 +729,6 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
-        return_user_id=return_user_id,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -757,7 +751,6 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
-        return_user_id=return_user_id,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
